@@ -1,10 +1,20 @@
+
 import { app } from './app.ts';
 import { env } from './config/env.ts';
 import { closePool, isDatabaseConfigured } from './database/pool.ts';
 
-const server = app.listen(env.PORT, env.HOST, () => {
-  console.log(`API listening on http://${env.HOST}:${env.PORT}/api (${env.NODE_ENV})`);
-  if (!isDatabaseConfigured) console.warn('DATABASE_URL is not set: data endpoints return database_not_configured.');
+// Render production server configuration
+const HOST = '0.0.0.0';
+const PORT = Number(process.env.PORT) || env.PORT;
+
+const server = app.listen(PORT, HOST, () => {
+  console.log(`API listening on http://${HOST}:${PORT}/api (${env.NODE_ENV})`);
+
+  if (!isDatabaseConfigured) {
+    console.warn(
+      'DATABASE_URL is not set: data endpoints return database_not_configured.'
+    );
+  }
 });
 
 server.on('error', (err) => {
@@ -14,8 +24,13 @@ server.on('error', (err) => {
 
 function shutdown(signal: string) {
   console.log(`${signal} received, shutting down.`);
-  server.close(() => void closePool().finally(() => process.exit(0)));
+
+  server.close(() => {
+    void closePool().finally(() => process.exit(0));
+  });
+
   server.closeIdleConnections();
+
   setTimeout(() => process.exit(1), 10_000).unref();
 }
 
