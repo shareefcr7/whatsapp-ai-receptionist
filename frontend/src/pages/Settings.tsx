@@ -1,13 +1,15 @@
 import { useState } from 'react';
 import { Card, ErrorState, FormError, PageHeader, primaryButtonClass, secondaryButtonClass, Skeleton, StatusList, SuccessNotice } from '../components/ui';
 import { ApiError, apiRequest, useApi } from '../lib/api';
-import type { ApiIndex, GoogleCalendarStatus } from '../lib/api';
+import type { ApiIndex, ApiState, GoogleCalendarStatus } from '../lib/api';
 import { useAuth } from '../lib/auth';
+import { integrationItems } from '../lib/integrations';
 import { useSystemStatus } from '../lib/useSystemStatus';
-import { integrationItems } from './Overview';
 
 export function Settings() {
   const { result, error, loading, refetch } = useApi<ApiIndex>('');
+  // One fetch for both cards, so Connect and Disconnect refresh the Integrations list too.
+  const google = useApi<GoogleCalendarStatus>('/integrations/google/status');
   const { api, database } = useSystemStatus();
 
   return (
@@ -24,12 +26,12 @@ export function Settings() {
           />
         </Card>
         <Card title="Integrations">
-          {loading ? <Skeleton rows={3} /> : error ? <ErrorState error={error} onRetry={refetch} /> : <StatusList items={integrationItems(result?.data)} />}
+          {loading ? <Skeleton rows={3} /> : error ? <ErrorState error={error} onRetry={refetch} /> : <StatusList items={integrationItems(result?.data, google.result?.data)} />}
           <p className="border-t border-stone-100 px-5 py-3 text-xs text-stone-500">
             "Integration pending" means credentials are set but no integration code uses them yet.
           </p>
         </Card>
-        <GoogleCalendarCard />
+        <GoogleCalendarCard status={google} />
       </div>
     </>
   );
@@ -45,9 +47,9 @@ const CALLBACK_REASONS: Record<string, string> = {
   CALENDAR_INVALID_GRANT: 'Google rejected the authorization code. Try again.',
 };
 
-function GoogleCalendarCard() {
+function GoogleCalendarCard({ status }: { status: ApiState<GoogleCalendarStatus> }) {
   const { isAdmin } = useAuth();
-  const { result, error, loading, refetch } = useApi<GoogleCalendarStatus>('/integrations/google/status');
+  const { result, error, loading, refetch } = status;
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<ApiError | null>(null);
   const [notice, setNotice] = useState<string | null>(() => {

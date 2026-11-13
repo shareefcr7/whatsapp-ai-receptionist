@@ -25,6 +25,7 @@
     "dev": "vite",
     "typecheck": "tsc --noEmit",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node --test \"test/**/*.test.ts\""
   }
 }

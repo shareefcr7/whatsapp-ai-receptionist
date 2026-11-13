@@ -4,10 +4,10 @@ import type { ReactNode } from 'react';
 import { Link } from 'react-router';
 import { Card, CustomerCell, DataStateNotice, EmptyState, ErrorState, PageHeader, Skeleton, StatusBadge, StatusList } from '../components/ui';
 import { useApi } from '../lib/api';
-import type { ApiIndex, DashboardSummary } from '../lib/api';
+import type { ApiIndex, DashboardSummary, GoogleCalendarStatus } from '../lib/api';
 import { formatDateTime } from '../lib/format';
+import { integrationItems } from '../lib/integrations';
 import { useSystemStatus } from '../lib/useSystemStatus';
-import type { StatusItem } from '../lib/useSystemStatus';
 
 function Kpi({ label, value, icon: Icon, loading }: { label: string; value: number | undefined; icon: LucideIcon; loading: boolean }) {
   return (
@@ -64,33 +64,10 @@ function Section<T extends { id: string }>(props: {
   );
 }
 
-const READY_DETAIL = {
-  whatsapp: 'Built · not connected until Meta verifies the webhook',
-  openai: 'Built · not in use until WhatsApp is connected',
-  googleCalendar: 'Built · connect it in Settings',
-} as const;
-
-export function integrationItems(index: ApiIndex | undefined): StatusItem[] {
-  const names = { whatsapp: 'WhatsApp', openai: 'OpenAI', googleCalendar: 'Google Calendar' } as const;
-  return (Object.keys(names) as (keyof typeof names)[]).map((key) => {
-    const integration = index?.integrations[key];
-    return {
-      label: names[key],
-      tone: 'neutral',
-      detail: !integration
-        ? 'Unknown'
-        : integration.credentials === 'missing'
-          ? 'Not connected · credentials missing'
-          : integration.implementation === 'ready'
-            ? READY_DETAIL[key]
-            : 'Not connected · integration pending',
-    };
-  });
-}
-
 export function Overview() {
   const { result, error, loading, refetch } = useApi<DashboardSummary>('/dashboard/summary');
   const index = useApi<ApiIndex>('');
+  const google = useApi<GoogleCalendarStatus>('/integrations/google/status');
   const { api, database } = useSystemStatus();
   const summary = result?.data;
   const errorNode = error && <ErrorState error={error} onRetry={refetch} />;
@@ -169,7 +146,7 @@ export function Overview() {
           )}
         />
         <Card title="API and system status">
-          <StatusList items={[api, database, ...integrationItems(index.result?.data)]} />
+          <StatusList items={[api, database, ...integrationItems(index.result?.data, google.result?.data)]} />
           <p className="border-t border-stone-100 px-5 py-3 text-xs text-stone-500">
             WhatsApp webhook, OpenAI replies and Google Calendar are built. WhatsApp is not connected until Meta verifies the webhook; bookings do not use the calendar yet.
           </p>
