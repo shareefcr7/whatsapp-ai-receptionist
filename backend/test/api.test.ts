@@ -11,7 +11,8 @@ process.env.DATABASE_URL = testDatabaseUrl ?? '';
 const { app } = await import('../src/app.ts');
 const { parseEnv } = await import('../src/config/env.ts');
 const { errorHandler } = await import('../src/middleware/errors.ts');
-const { closePool, pool } = await import('../src/database/pool.ts');
+const { closePool, pool, sslFor } = await import('../src/database/pool.ts');
+const { default: pg } = await import('pg');
 const { migrate } = await import('../src/database/migrate.ts');
 const { whatsAppService } = await import('../src/services/whatsapp/index.ts');
 const { calendarService } = await import('../src/services/calendar/index.ts');
@@ -218,6 +219,35 @@ describe('API basics', () => {
     await assert.rejects(calendarService.deleteEvent('x'), { code: 'CALENDAR_NOT_CONFIGURED' });
     await assert.rejects(bookingService.cancel('x'), refused);
     await assert.rejects(leadService.updateStatus('x', 'lost'), refused);
+  });
+});
+
+describe('database TLS', () => {
+  // What pg will actually use: the pool's ssl option, overridden by anything in the URL. A Client does not connect until asked.
+  const effectiveSsl = (url: string) => (new pg.Client({ connectionString: url, ssl: sslFor(url) }) as unknown as { ssl: unknown }).ssl;
+  // pg verifies certificates unless rejectUnauthorized is false: true and {} both mean verified TLS.
+  const verified = (ssl: unknown) => ssl === true || (typeof ssl === 'object' && ssl !== null && (ssl as { rejectUnauthorized?: boolean }).rejectUnauthorized !== false);
+
+  it('uses verified TLS for a public host such as Render External URL', () => {
+    assert.ok(verified(effectiveSsl('postgresql://u:p@dpg-abc123-a.oregon-postgres.render.com/app')));
+  });
+
+  it('stays plain for local development and private single-label hosts', () => {
+    for (const url of [
+      'postgresql://u:p@localhost:5432/app',
+      'postgresql://u@127.0.0.1/app',
+      'postgresql://u@[::1]/app',
+      'postgresql:///app?host=/var/run/postgresql',
+      'postgresql://u:p@dpg-abc123-a/app', // Render Internal URL
+    ]) {
+      assert.equal(effectiveSsl(url), false, url);
+    }
+  });
+
+  it('lets sslmode in the URL decide', () => {
+    assert.equal(effectiveSsl('postgresql://u:p@db.example.com/app?sslmode=disable'), false);
+    assert.ok(verified(effectiveSsl('postgresql://u:p@localhost/app?sslmode=verify-full')));
+    assert.equal(sslFor('postgresql://u:p@db.example.com/app?sslmode=verify-full'), undefined);
   });
 });
 
