@@ -170,6 +170,14 @@ export async function processWebhook(payload: WebhookPayload): Promise<WebhookRe
     const value = change.value;
     // Other fields (account updates, template reviews) and other phone numbers are not ours to handle.
     if (change.field !== 'messages' || !value || (env.WHATSAPP_PHONE_NUMBER_ID && value.metadata?.phone_number_id !== env.WHATSAPP_PHONE_NUMBER_ID)) {
+      // A phone number ID is an identifier, not a secret; logging the received one makes a misconfigured
+      // WHATSAPP_PHONE_NUMBER_ID visible. Never the message content.
+      if (change.field === 'messages' && value) {
+        console.warn(
+          `WhatsApp webhook: ignored a change for phone_number_id ${JSON.stringify(value.metadata?.phone_number_id ?? null)}: ` +
+            `it is not the configured WHATSAPP_PHONE_NUMBER_ID (Meta's dashboard Test sends a placeholder ID).`,
+        );
+      }
       result.ignored += 1;
       continue;
     }

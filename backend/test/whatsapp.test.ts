@@ -18,6 +18,7 @@ Object.assign(process.env, {
 });
 
 const { app } = await import('../src/app.ts');
+const { env } = await import('../src/config/env.ts');
 const { closePool, pool } = await import('../src/database/pool.ts');
 const { migrate } = await import('../src/database/migrate.ts');
 const { whatsAppService, GRAPH_VERSION } = await import('../src/services/whatsapp/index.ts');
@@ -132,17 +133,56 @@ describe('webhook signature (POST)', () => {
     assert.deepEqual(res.data, { processed: 0, duplicate: 0, ignored: 1, failed: 0 });
   });
 
-  it('rejects a missing, malformed, wrong-secret or other-body signature', async () => {
-    for (const signature of [null, '', 'sha256=', 'sha1=abc', sign(body, 'another-secret'), sign(`${body} `), sign(body).toUpperCase()]) {
+  const warnings = (fn: { mock: { calls: { arguments: unknown[] }[] } }) => fn.mock.calls.map((c) => String(c.arguments[0]));
+  // Nothing from the request or the configuration may reach the log.
+  const assertNoSensitiveData = (lines: string[], extra: string[] = []) => {
+    for (const line of lines) {
+      for (const secret of [APP_SECRET, 'EAAtest-access-token', 'verify-token-for-tests-0123456789', 'sha256=', ...extra]) {
+        assert.ok(!line.includes(secret), `log leaked ${secret}: ${line}`);
+      }
+    }
+  };
+
+  it('rejects a missing, malformed, wrong-secret or other-body signature, and logs only the reason', async (t) => {
+    const warn = t.mock.method(console, 'warn', () => {});
+    const signatures = [null, '', 'sha256=', 'sha1=abc', sign(body, 'another-secret'), sign(`${body} `), sign(body).toUpperCase()];
+    for (const signature of signatures) {
       const { status, body: res } = await post(body, signature);
       assert.equal(status, 401, String(signature));
       assert.equal(res.error.code, 'INVALID_SIGNATURE');
     }
+    assert.deepEqual(warnings(warn), signatures.map(() => 'WhatsApp webhook rejected: invalid signature'));
+    assertNoSensitiveData(warnings(warn), [body]);
   });
 
-  it('rejects an empty body and signed non-JSON', async () => {
+  it('rejects an empty body and signed non-JSON, and logs only the reason', async (t) => {
+    const warn = t.mock.method(console, 'warn', () => {});
     assert.equal((await post('', sign(''))).status, 400);
     assert.equal((await post('not json', sign('not json'))).status, 400);
+    assert.deepEqual(warnings(warn), ['WhatsApp webhook rejected: empty body', 'WhatsApp webhook rejected: invalid JSON']);
+    assertNoSensitiveData(warnings(warn), ['not json']);
+  });
+
+  it('returns 503 and logs the reason when the app secret is not configured', async (t) => {
+    const warn = t.mock.method(console, 'warn', () => {});
+    const saved = env.WHATSAPP_APP_SECRET;
+    env.WHATSAPP_APP_SECRET = undefined;
+    try {
+      const { status, body: res } = await post(body, sign(body));
+      assert.equal(status, 503);
+      assert.equal(res.error.code, 'WHATSAPP_NOT_CONFIGURED');
+    } finally {
+      env.WHATSAPP_APP_SECRET = saved;
+    }
+    assert.deepEqual(warnings(warn), ['WhatsApp webhook rejected: app secret not configured']);
+    assertNoSensitiveData(warnings(warn), [body]);
+  });
+
+  it('logs no rejection for a valid delivery', async (t) => {
+    const warn = t.mock.method(console, 'warn', () => {});
+    t.mock.method(console, 'info', () => {});
+    assert.equal((await post(body, sign(body))).status, 200);
+    assert.equal(warn.mock.callCount(), 0);
   });
 
   it('needs no session, and other JSON routes still parse JSON', async () => {
@@ -153,6 +193,44 @@ describe('webhook signature (POST)', () => {
     });
     assert.equal(res.status, 400);
     assert.equal(((await res.json()) as any).error.code, 'VALIDATION_ERROR'); // parsed, then validated
+  });
+});
+
+describe('phone number ID filter and logging', () => {
+  const META_SAMPLE_PHONE_NUMBER_ID = '123456123'; // what Meta's dashboard Test sends; test data only
+  const lines = (fn: { mock: { calls: { arguments: unknown[] }[] } }) => fn.mock.calls.map((c) => String(c.arguments[0]));
+
+  it("ignores Meta's dashboard sample, saves nothing, and logs the received ID", async (t) => {
+    const warn = t.mock.method(console, 'warn', () => {});
+    const info = t.mock.method(console, 'info', () => {});
+    const { status, body } = await post(payload(textMessage('wamid.SAMPLE', '15550001999', 'sample text'), META_SAMPLE_PHONE_NUMBER_ID));
+    assert.equal(status, 200);
+    assert.deepEqual(body.data, { processed: 0, duplicate: 0, ignored: 1, failed: 0 });
+    assert.equal(warn.mock.callCount(), 1);
+    assert.match(lines(warn)[0]!, /ignored a change for phone_number_id "123456123"/);
+    assert.deepEqual(lines(info), ['WhatsApp webhook: processed=0 duplicate=0 ignored=1 failed=0']);
+    // Never the message content, the sender, or the configured ID.
+    for (const line of [...lines(warn), ...lines(info)]) {
+      assert.ok(!line.includes('sample text') && !line.includes('15550001999') && !line.includes(PHONE_NUMBER_ID), line);
+    }
+  });
+
+  it('does not warn for a non-WhatsApp object or another field', async (t) => {
+    const warn = t.mock.method(console, 'warn', () => {});
+    t.mock.method(console, 'info', () => {});
+    await post(JSON.stringify({ object: 'page', entry: [] }));
+    const otherField = JSON.stringify({ object: 'whatsapp_business_account', entry: [{ changes: [{ field: 'account_update', value: {} }] }] });
+    assert.deepEqual((await post(otherField)).body.data, { processed: 0, duplicate: 0, ignored: 1, failed: 0 });
+    assert.equal(warn.mock.callCount(), 0);
+  });
+
+  // With a database, the 'message persistence' suite proves the same payload is saved.
+  it('lets the configured phone number ID through to persistence', { skip: Boolean(testDatabaseUrl) }, async (t) => {
+    const warn = t.mock.method(console, 'warn', () => {});
+    const { status, body } = await post(payload(textMessage('wamid.REAL', '15550001000', 'hello')));
+    assert.equal(status, 503); // reached the save step: not ignored
+    assert.equal(body.error.code, 'DATABASE_NOT_CONFIGURED');
+    assert.equal(warn.mock.callCount(), 0);
   });
 });
 

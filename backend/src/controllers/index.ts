@@ -298,21 +298,35 @@ export const whatsappVerify: RequestHandler = (req, res) => {
   res.status(403).send('Forbidden');
 };
 
+/** A fixed label only: never the body, the signature or a secret. Makes a wrong WHATSAPP_APP_SECRET visible in the logs. */
+const rejectedWebhook = (reason: 'app secret not configured' | 'empty body' | 'invalid signature' | 'invalid JSON') =>
+  console.warn(`WhatsApp webhook rejected: ${reason}`);
+
 export const whatsappWebhook: RequestHandler = async (req, res) => {
-  if (!env.WHATSAPP_APP_SECRET) throw new AppError(503, 'WHATSAPP_NOT_CONFIGURED', 'WHATSAPP_APP_SECRET is not set.');
+  if (!env.WHATSAPP_APP_SECRET) {
+    rejectedWebhook('app secret not configured');
+    throw new AppError(503, 'WHATSAPP_NOT_CONFIGURED', 'WHATSAPP_APP_SECRET is not set.');
+  }
   const raw: unknown = req.body;
-  if (!Buffer.isBuffer(raw) || raw.length === 0) throw new AppError(400, 'BAD_REQUEST', 'Expected a JSON body.');
+  if (!Buffer.isBuffer(raw) || raw.length === 0) {
+    rejectedWebhook('empty body');
+    throw new AppError(400, 'BAD_REQUEST', 'Expected a JSON body.');
+  }
   if (!whatsAppService.verifySignature(raw, req.get('x-hub-signature-256') ?? '')) {
+    rejectedWebhook('invalid signature');
     throw new AppError(401, 'INVALID_SIGNATURE', 'The webhook signature is missing or wrong.');
   }
   let payload: unknown;
   try {
     payload = JSON.parse(raw.toString('utf8'));
   } catch {
+    rejectedWebhook('invalid JSON');
     throw new AppError(400, 'BAD_REQUEST', 'The webhook body is not valid JSON.');
   }
   const result = await processWebhook(payload as Parameters<typeof processWebhook>[0]);
-  // Counts only: never the payload, which holds customer messages and phone numbers.
-  if (result.failed) console.warn(`WhatsApp webhook: ${result.failed} item(s) could not be saved (see webhook_events.error_message).`);
+  // One line per delivery, counts only: never the payload, which holds customer messages and phone numbers.
+  const summary = `WhatsApp webhook: processed=${result.processed} duplicate=${result.duplicate} ignored=${result.ignored} failed=${result.failed}`;
+  if (result.failed) console.warn(`${summary} (see webhook_events.error_message)`);
+  else console.info(summary);
   ok(res, result);
 };
