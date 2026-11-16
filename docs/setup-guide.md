@@ -66,20 +66,32 @@ The database user needs permission to create the `btree_gist` extension. It is a
 npm test
 ```
 
-To include the PostgreSQL tests, create a **separate, disposable** database. These tests commit rows and delete every row in `staff_users`, `services`, `business_info` and `usage_logs`, so never point them at real data:
+To include the PostgreSQL tests, create a **separate, disposable** database whose name ends in `_test` (PostgreSQL 14 or later). The tests commit rows, and delete every row in `services`, `business_info`, `usage_logs`, WhatsApp `webhook_events` and the Google Calendar tables, plus all test customers (`+1555000…` phone numbers) and test staff (`…@example.test`). They refuse to start against a database whose name does not end in `_test`:
 
 ```bash
 createdb receptionist_test
 TEST_DATABASE_URL=postgresql://YOUR_USER@localhost:5432/receptionist_test npm test
 ```
 
-The tests expect an empty database, so drop and recreate it if a run is interrupted.
+Use a `postgres://` or `postgresql://` URL: those are the only kinds the app accepts. The `_test` check reads `TEST_DATABASE_URL` the way the PostgreSQL driver does. It also recognises `socket:` URLs (whose database is the `?db=` parameter), but only so it can refuse unsafe ones; the app would reject them anyway. The tests then confirm the name with the server itself before any clean-up, so a connection pooler alias that leads to a different database is refused too.
+
+If a run is interrupted, the next run cleans up after it automatically (leftover test rows, temporary `test_*` triggers and functions, and test sessions still holding locks) and prints what it removed. Test files must run one at a time against one database, as `npm test` does (`--test-concurrency=1`); running them in parallel against the same database makes them interfere.
+
+Two checks in `test/db-hygiene.test.ts` need the test role to be allowed to create databases (they are skipped otherwise). They create a throwaway database named `receptionist_guardcheck` on the same server, point other test files at it to prove nothing is deleted there, and drop it again (also dropping any leftover of that name first). Do not give a real database that name. The same file also uses two fixed fixtures outside the test namespaces, `+447700900123` and `owner@clinic.invalid`, which the tests remove themselves.
 
 Run both forms before calling a change tested: each one skips the suite that needs the opposite setup. The authentication, business information and services suites only run with `TEST_DATABASE_URL` set.
 
 ## Changing the schema
 
 Add a numbered file such as `database/migrations/002_add_x.sql`, run `npm run migrate`, and update `database/schema.sql` to match. Never edit a migration that has already been applied. `schema.sql` is a reference snapshot; the migrations are what get applied.
+
+## Audit trail and deleting data
+
+Staff actions (replies, takeovers, hand-backs, closing, reactivating a customer) are recorded in `conversation_events`, which cannot be updated, deleted or truncated. Because of that:
+
+- A customer, conversation or message that has audit history **cannot be deleted**: the delete fails instead of silently erasing who did what.
+- A staff member with history cannot be deleted. Deactivate them instead: `UPDATE staff_users SET is_active = false WHERE email = '...'`.
+- To erase a customer for a deliberate, recorded data-protection request, a database administrator runs the procedure in `database/migrations/005_audit_integrity.sql` (one transaction that sets `receptionist.audit_maintenance = 'on'`). The app has no API for this.
 
 ## Deploying to a VPS
 

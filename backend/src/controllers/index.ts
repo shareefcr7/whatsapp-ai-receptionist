@@ -10,7 +10,9 @@ import { completeAuthorization, connectionStatus, disconnect, STATE_COOKIE, star
 import { catalogService } from '../services/catalog/index.ts';
 import { whatsAppService } from '../services/whatsapp/index.ts';
 import { processWebhook } from '../services/whatsapp/webhook.ts';
-import { conversationService } from '../services/conversations/index.ts';
+import { replyToMessages } from '../services/ai/reply.ts';
+import { changeConversation, conversationService, reactivateCustomer, staffReply } from '../services/conversations/index.ts';
+import type { ConversationAction } from '../services/conversations/index.ts';
 import { integrationStatus } from '../services/integrations.ts';
 import { knowledgeService } from '../services/knowledge/index.ts';
 import { leadService } from '../services/leads/index.ts';
@@ -25,6 +27,7 @@ import {
   profileSchema,
   SERVICE_STATUSES,
   serviceSchema,
+  staffReplySchema,
 } from '../types/api.ts';
 import type { DataState, ListQuery, Page } from '../types/api.ts';
 import { AppError } from '../types/errors.ts';
@@ -116,6 +119,45 @@ export const databaseHealth: RequestHandler = async (_req, res) => {
 };
 
 export const listConversations = listEndpoint(listQuerySchema(CONVERSATION_STATUSES), (q) => conversationService.list(q));
+export const getConversation: RequestHandler = async (req, res) => {
+  ok(res, await conversationService.get(idParam.parse(req.params.id)));
+};
+
+// --- Staff handling of conversations. Any signed-in staff member; reactivating an opted-out customer is admin-only.
+
+/** Checked before reading the session: without a database there is no signed-in staff member. */
+const staffId = (res: Response): string => {
+  requirePool();
+  return res.locals.staff.id;
+};
+
+const conversationAction = (action: ConversationAction): RequestHandler => async (req, res) => {
+  const id = idParam.parse(req.params.id);
+  ok(res, await changeConversation(id, action, staffId(res)));
+};
+export const takeOverConversation = conversationAction('takeover');
+export const reopenConversation = conversationAction('reopen');
+export const closeConversation = conversationAction('close');
+
+export const replyToConversation: RequestHandler = async (req, res) => {
+  const id = idParam.parse(req.params.id);
+  const { text, clientMessageId } = staffReplySchema.parse(req.body);
+  const { replayed, ...message } = await staffReply(id, staffId(res), text, clientMessageId);
+  // 201 sent (200 when this repeats an earlier submission). 202 not confirmed, fresh or repeated: 'unknown' (it may
+  // have reached the customer) or 'queued' (still sending). Never a success code for an unconfirmed message.
+  const confirmed = ['sent', 'delivered', 'read'].includes(message.status);
+  res.status(!confirmed ? 202 : replayed ? 200 : 201);
+  ok(res, message);
+};
+
+export const reactivateConversationCustomer: RequestHandler = async (req, res) => {
+  const id = idParam.parse(req.params.id);
+  const result = await reactivateCustomer(id, staffId(res));
+  // IDs only: who restored messaging for which customer.
+  console.info(`Customer ${result.customerId} reactivated by staff ${staffId(res)}`);
+  ok(res, result);
+};
+
 export const listLeads = listEndpoint(listQuerySchema(LEAD_STATUSES), (q) => leadService.list(q));
 export const listAppointments = listEndpoint(listQuerySchema(APPOINTMENT_STATUSES), (q) => bookingService.list(q));
 
@@ -323,10 +365,16 @@ export const whatsappWebhook: RequestHandler = async (req, res) => {
     rejectedWebhook('invalid JSON');
     throw new AppError(400, 'BAD_REQUEST', 'The webhook body is not valid JSON.');
   }
-  const result = await processWebhook(payload as Parameters<typeof processWebhook>[0]);
+  const { received, ...result } = await processWebhook(payload as Parameters<typeof processWebhook>[0]);
   // One line per delivery, counts only: never the payload, which holds customer messages and phone numbers.
   const summary = `WhatsApp webhook: processed=${result.processed} duplicate=${result.duplicate} ignored=${result.ignored} failed=${result.failed}`;
   if (result.failed) console.warn(`${summary} (see webhook_events.error_message)`);
   else console.info(summary);
+  // Replies take seconds; Meta retries a slow webhook. So answer first, then reply once the response is sent.
+  if (received.length && env.AI_AUTO_REPLY_ENABLED) {
+    res.once('finish', () => {
+      replyToMessages(received).catch(() => console.error('AI auto-reply: background task failed'));
+    });
+  }
   ok(res, result);
 };

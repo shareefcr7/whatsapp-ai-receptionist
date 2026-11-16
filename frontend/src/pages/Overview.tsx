@@ -99,7 +99,9 @@ export function Overview() {
           row={(c) => (
             <>
               <div className="min-w-0">
-                <CustomerCell name={c.customerName} phone={c.customerPhone} />
+                <Link to={`/conversations/${c.id}`} className="block rounded hover:text-brand-700 hover:underline">
+                  <CustomerCell name={c.customerName} phone={c.customerPhone} />
+                </Link>
                 {c.lastMessage && <p className="mt-1 truncate text-stone-500">{c.lastMessage}</p>}
               </div>
               <StatusBadge status={c.status} />

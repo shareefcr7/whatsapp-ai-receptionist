@@ -34,6 +34,14 @@ export const SERVICE_STATUSES = ['active', 'inactive'] as const;
 
 export const idParam = z.uuid();
 
+// WhatsApp's text limit is 4096 characters.
+// Strict: the sender is always the signed-in staff member, so a staffId (or any other field) in the body is refused.
+// clientMessageId: one per draft, so a repeated submission returns the first message instead of sending it again.
+export const staffReplySchema = z.strictObject({
+  text: z.string().trim().min(1, 'Message is required.').max(4096),
+  clientMessageId: z.uuid().optional(),
+});
+
 const optionalText = (max: number) => z.string().trim().max(max).default('');
 
 export const loginSchema = z.strictObject({

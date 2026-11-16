@@ -2,6 +2,7 @@
 import { app } from './app.ts';
 import { env } from './config/env.ts';
 import { closePool, isDatabaseConfigured } from './database/pool.ts';
+import { startRecovery } from './services/ai/reply.ts';
 
 // Render production server configuration
 const HOST = '0.0.0.0';
@@ -15,6 +16,8 @@ const server = app.listen(PORT, HOST, () => {
       'DATABASE_URL is not set: data endpoints return database_not_configured.'
     );
   }
+  // Hands to staff any messages left unanswered by a previous process (restart or deploy).
+  startRecovery();
 });
 
 server.on('error', (err) => {

@@ -11,7 +11,11 @@ const LOCK_ID = 727274; // arbitrary, shared by every migrate run
 export async function migrate(): Promise<string[]> {
   const client = await requirePool().connect();
   const applied: string[] = [];
+  let reusable = true;
   try {
+    // No statement timeout for this dedicated connection: a migration, or waiting for another deploy's migrate to
+    // finish (the advisory lock below), can legitimately outlast DB_STATEMENT_TIMEOUT_MS. Reset before release.
+    await client.query('SET statement_timeout = 0');
     await client.query('SELECT pg_advisory_lock($1)', [LOCK_ID]);
     await client.query(`CREATE TABLE IF NOT EXISTS schema_migrations (
       name text PRIMARY KEY,
@@ -39,7 +43,9 @@ export async function migrate(): Promise<string[]> {
     return applied;
   } finally {
     await client.query('SELECT pg_advisory_unlock($1)', [LOCK_ID]).catch(() => {});
-    client.release();
+    // Back to the connection's startup value, so the pool never hands out a connection without the timeout.
+    await client.query('RESET statement_timeout').catch(() => (reusable = false));
+    client.release(!reusable);
   }
 }
 

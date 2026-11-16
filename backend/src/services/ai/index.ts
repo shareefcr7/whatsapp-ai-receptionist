@@ -100,7 +100,7 @@ export const aiService: AiService = {
     if (!res.ok) throw openAiError(res.status, body.error);
     const raw = body.choices?.[0]?.message?.content ?? '';
     return {
-      text: raw.replace(HANDOVER, '').trim(),
+      text: raw.replaceAll(HANDOVER, '').trim(),
       model: body.model ?? env.OPENAI_MODEL,
       inputTokens: body.usage?.prompt_tokens ?? 0,
       outputTokens: body.usage?.completion_tokens ?? 0,

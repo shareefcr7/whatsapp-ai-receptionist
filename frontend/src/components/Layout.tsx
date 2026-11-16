@@ -71,7 +71,8 @@ export function Layout() {
   const { api, database } = useSystemStatus();
   const { staff, signOut } = useAuth();
   const [signOutFailed, setSignOutFailed] = useState(false);
-  const title = NAV.find((item) => item.to === pathname)?.label ?? 'Not found';
+  // A sub-page such as /conversations/:id takes its section's title.
+  const title = NAV.find((item) => item.to === pathname || (item.to !== '/' && pathname.startsWith(`${item.to}/`)))?.label ?? 'Not found';
 
   useEffect(() => setMenuOpen(false), [pathname]);
 

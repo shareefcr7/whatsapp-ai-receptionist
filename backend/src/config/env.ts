@@ -15,6 +15,21 @@ const schema = z
     ),
     OPENAI_API_KEY: optional,
     OPENAI_MODEL: z.preprocess((v) => (v === '' ? undefined : v), z.string().default('gpt-4.1-mini')),
+    // Off unless exactly "true": a typo fails startup instead of silently enabling paid replies.
+    AI_AUTO_REPLY_ENABLED: z.preprocess(
+      (v) => (v === '' ? undefined : typeof v === 'string' ? v.trim().toLowerCase() : v),
+      z.enum(['true', 'false'], { error: 'must be "true" or "false"' }).default('false').transform((v) => v === 'true'),
+    ),
+    // OpenAI calls allowed in any rolling 24 hours, in total and per customer. 0 stops AI replies.
+    AI_DAILY_REPLY_LIMIT: z.preprocess((v) => (v === '' ? undefined : v), z.coerce.number().int().min(0).max(100_000).default(200)),
+    AI_CUSTOMER_DAILY_REPLY_LIMIT: z.preprocess((v) => (v === '' ? undefined : v), z.coerce.number().int().min(0).max(1_000).default(20)),
+    // Server-side limit on any one database statement, so a slow or stuck query cannot hold a conversation lock or a
+    // send slot for long. (A network partition is not covered: the server cannot cancel what it cannot reach.)
+    // At least 5s: it must stay above the 3s conversation lock_timeout, or a lock wait would be cancelled as a
+    // statement timeout instead of answering "busy".
+    DB_STATEMENT_TIMEOUT_MS: z.preprocess((v) => (v === '' ? undefined : v), z.coerce.number().int().min(5_000).max(600_000).default(30_000)),
+    // Older messages (by Meta's timestamp, e.g. delivered late after an outage) go to staff instead of the AI.
+    AI_MAX_MESSAGE_AGE_MINUTES: z.preprocess((v) => (v === '' ? undefined : v), z.coerce.number().int().min(1).max(1_440).default(15)),
     WHATSAPP_ACCESS_TOKEN: optional,
     WHATSAPP_PHONE_NUMBER_ID: optional,
     WHATSAPP_BUSINESS_ACCOUNT_ID: optional,

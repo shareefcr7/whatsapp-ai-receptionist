@@ -6,13 +6,21 @@ import { AppError } from '../../types/errors.ts';
 export const GRAPH_VERSION = 'v23.0';
 const MAX_ATTEMPTS = 3;
 const RETRY_DELAYS_MS = [300, 900];
-// Retried only when Meta asked us to slow down or was briefly unavailable.
-const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
-// Connection errors where the request certainly never reached Meta. A timeout is NOT here: the message may have been sent.
-const NOT_SENT = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'ECONNRESET']);
+// Retried only when Meta refused the request (429: slow down), so a retry cannot send the message twice.
+const RETRYABLE_STATUS = new Set([429]);
+// Connection errors where the request certainly never reached Meta, so a retry is safe. Not here, because the message
+// may have been sent: a timeout, ECONNRESET (dropped mid-request) and any other socket error.
+const NOT_SENT = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT']);
+
+/** WhatsApp gave no clear answer: the message may or may not have reached the customer. Never retried automatically. */
+const DELIVERY_UNKNOWN = 'WHATSAPP_DELIVERY_UNKNOWN';
+export const deliveryUnknown = () =>
+  new AppError(504, DELIVERY_UNKNOWN, 'WhatsApp did not confirm this message. It may already have reached the customer.');
+export const isDeliveryUnknown = (err: unknown) => err instanceof AppError && err.code === DELIVERY_UNKNOWN;
 
 export interface WhatsAppService {
-  sendText(to: string, body: string): Promise<{ whatsappMessageId: string }>;
+  /** `trackingId` (our message ID) is echoed by Meta in delivery-status webhooks as biz_opaque_callback_data. */
+  sendText(to: string, body: string, trackingId?: string): Promise<{ whatsappMessageId: string }>;
   sendTemplate(to: string, template: string, language: string, params: string[]): Promise<{ whatsappMessageId: string }>;
   /** Checks X-Hub-Signature-256 against the raw request body. False when WHATSAPP_APP_SECRET is not set. */
   verifySignature(rawBody: Buffer, signature: string): boolean;
@@ -66,28 +74,36 @@ async function send(to: string, message: Record<string, unknown>): Promise<{ wha
       });
     } catch (err) {
       const code = (err as { cause?: { code?: string } }).cause?.code;
-      if (attempt < MAX_ATTEMPTS && code && NOT_SENT.has(code)) {
-        await retry();
-        continue;
+      if (code && NOT_SENT.has(code)) {
+        if (attempt < MAX_ATTEMPTS) {
+          await retry();
+          continue;
+        }
+        throw new AppError(503, 'WHATSAPP_UNREACHABLE', 'Could not connect to WhatsApp, so the message was not sent. Try again shortly.');
       }
-      throw new AppError(503, 'WHATSAPP_UNREACHABLE', 'Could not reach WhatsApp (network error or timeout). The message may not have been sent.');
+      throw deliveryUnknown(); // timeout or dropped connection: the request may have reached Meta
     }
-    const reply = (await res.json().catch(() => ({}))) as { messages?: { id?: string }[]; error?: { code?: number } };
+    // Anything but a JSON object (a literal null, a number, HTML) carries no message ID: treated as an empty reply.
+    const parsed: unknown = await res.json().catch(() => null);
+    const reply = (parsed && typeof parsed === 'object' ? parsed : {}) as { messages?: { id?: string }[]; error?: { code?: number } };
     if (res.ok) {
       const id = reply.messages?.[0]?.id;
-      if (!id) throw new AppError(502, 'WHATSAPP_ERROR', 'WhatsApp accepted the request but returned no message ID.');
+      if (!id) throw deliveryUnknown(); // accepted, but no ID to prove what happened
       return { whatsappMessageId: id };
     }
     if (attempt < MAX_ATTEMPTS && RETRYABLE_STATUS.has(res.status)) {
       await retry();
       continue;
     }
+    // A server error from Meta does not say whether the message went out.
+    if (res.status >= 500) throw deliveryUnknown();
     throw metaError(res.status, reply.error?.code);
   }
 }
 
 export const whatsAppService: WhatsAppService = {
-  sendText: (to, text) => send(to, { type: 'text', text: { body: text, preview_url: false } }),
+  sendText: (to, text, trackingId) =>
+    send(to, { type: 'text', text: { body: text, preview_url: false }, ...(trackingId && { biz_opaque_callback_data: trackingId }) }),
 
   sendTemplate: (to, template, language, params) =>
     send(to, {

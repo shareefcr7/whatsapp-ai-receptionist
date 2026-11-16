@@ -3,11 +3,14 @@ import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
 import type { Server } from 'node:http';
 import { after, before, beforeEach, describe, it } from 'node:test';
+import { assertDisposableDatabaseUrl, isDatabaseVerified } from './helpers/db-hygiene.ts';
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL;
+assertDisposableDatabaseUrl(testDatabaseUrl); // before any hook: after() hooks still run if before() fails
 const APP_SECRET = 'test-app-secret-0123456789abcdef';
 const PHONE_NUMBER_ID = '111111111111111';
 Object.assign(process.env, {
+  PGAPPNAME: 'receptionist-test', // tags this run's sessions; see test/helpers/db-hygiene.ts
   NODE_ENV: 'test',
   DATABASE_URL: testDatabaseUrl ?? '',
   WHATSAPP_ACCESS_TOKEN: 'EAAtest-access-token',
@@ -23,6 +26,7 @@ const { closePool, pool } = await import('../src/database/pool.ts');
 const { migrate } = await import('../src/database/migrate.ts');
 const { whatsAppService, GRAPH_VERSION } = await import('../src/services/whatsapp/index.ts');
 const { messageText } = await import('../src/services/whatsapp/webhook.ts');
+const { prepareTestDatabase } = await import('./helpers/db-hygiene.ts');
 
 // --- Meta mock: non-local requests go to `meta` and are recorded.
 interface Call {
@@ -54,16 +58,23 @@ before(async () => {
   const address = server.address();
   assert(address && typeof address === 'object');
   base = `http://127.0.0.1:${address.port}/api/webhooks/whatsapp`;
-  if (testDatabaseUrl) await migrate();
+  if (testDatabaseUrl) {
+    await prepareTestDatabase(pool!); // refuses a non-_test database; recovers from an interrupted earlier run
+    await migrate();
+  }
 });
 after(async () => {
   server.close();
-  if (testDatabaseUrl) {
-    await pool!.query(`DELETE FROM webhook_events WHERE source = 'whatsapp'`);
-    await pool!.query(`DELETE FROM customers WHERE phone_number LIKE '+1555000%'`); // cascades to conversations and messages
+  // Only once the server confirmed a _test database: after() still runs when before() failed that check.
+  try {
+    if (testDatabaseUrl && isDatabaseVerified()) {
+      await pool!.query(`DELETE FROM webhook_events WHERE source = 'whatsapp'`);
+      await pool!.query(`DELETE FROM customers WHERE phone_number LIKE '+15550001%'`); // cascades to conversations and messages
+    }
+  } finally {
+    globalThis.fetch = realFetch;
+    await closePool(); // also when the clean-up fails, so the run cannot hang on open connections
   }
-  await closePool();
-  globalThis.fetch = realFetch;
 });
 beforeEach(() => {
   calls = [];
@@ -276,8 +287,9 @@ describe('sending (Meta mocked)', () => {
     assert.deepEqual(calls[1]!.body.template, { name: 'hello_world', language: { code: 'en_US' } });
   });
 
-  it('retries a 503 and a connection that never opened, then succeeds', async () => {
-    meta = (_c, n) => (n === 1 ? json(503, {}) : json(200, { messages: [{ id: 'wamid.R1' }] }));
+  // Only outcomes where Meta certainly did not send are retried: a 429 refusal, or a connection that never opened.
+  it('retries a 429 and a connection that never opened, then succeeds', async () => {
+    meta = (_c, n) => (n === 1 ? json(429, { error: { code: 130429 } }) : json(200, { messages: [{ id: 'wamid.R1' }] }));
     assert.equal((await whatsAppService.sendText('+15550001000', 'x')).whatsappMessageId, 'wamid.R1');
     assert.equal(calls.length, 2);
     calls = [];
@@ -292,8 +304,63 @@ describe('sending (Meta mocked)', () => {
     meta = () => {
       throw new DOMException('The operation was aborted due to timeout', 'TimeoutError');
     };
-    await assert.rejects(whatsAppService.sendText('+15550001000', 'x'), { code: 'WHATSAPP_UNREACHABLE' });
+    await assert.rejects(whatsAppService.sendText('+15550001000', 'x'), { code: 'WHATSAPP_DELIVERY_UNKNOWN' });
     assert.equal(calls.length, 1);
+  });
+
+  it('ambiguous outcomes are delivery-unknown and never retried; a connection that never opened is a definite "not sent"', async () => {
+    const ambiguous: [string, () => Response][] = [
+      ['connection reset mid-request', () => { throw networkError('ECONNRESET'); }],
+      ['other socket error', () => { throw networkError('UND_ERR_SOCKET'); }],
+      ['HTTP 500', () => json(500, { error: { code: 131000 } })],
+      ['HTTP 502', () => json(502, {})],
+      ['HTTP 503', () => json(503, {})],
+      ['HTTP 504', () => json(504, {})],
+      ['200 with no message ID', () => json(200, { messages: [] })],
+      ['200 with a non-JSON body', () => new Response('<html>ok</html>', { status: 200 })],
+    ];
+    for (const [label, answer] of ambiguous) {
+      calls = [];
+      meta = answer;
+      await assert.rejects(whatsAppService.sendText('+15550001000', 'x'), (err: any) => {
+        assert.equal(err.code, 'WHATSAPP_DELIVERY_UNKNOWN', label);
+        assert.match(err.message, /may already have reached the customer/);
+        return true;
+      });
+      assert.equal(calls.length, 1, `${label}: attempted once, never retried`);
+    }
+    calls = [];
+    meta = () => {
+      throw networkError('ECONNREFUSED');
+    };
+    await assert.rejects(whatsAppService.sendText('+15550001000', 'x'), (err: any) => err.code === 'WHATSAPP_UNREACHABLE' && /not sent/.test(err.message));
+    assert.equal(calls.length, 3, 'retried: it can never have been sent');
+  });
+
+  it('an unexpected 200 body (literal null, a number, a string, an array) is delivery-unknown, never a definite failure', async () => {
+    for (const body of ['null', '123', '"ok"', '[]', '{}']) {
+      calls = [];
+      meta = () => new Response(body, { status: 200, headers: { 'content-type': 'application/json' } });
+      await assert.rejects(whatsAppService.sendText('+15550001000', 'x'), (err: any) => {
+        assert.equal(err.code, 'WHATSAPP_DELIVERY_UNKNOWN', body);
+        return true;
+      });
+      assert.equal(calls.length, 1, `${body}: attempted once, never retried`);
+    }
+    // A definite refusal with an unusable body stays a definite failure.
+    calls = [];
+    meta = () => new Response('null', { status: 400 });
+    await assert.rejects(whatsAppService.sendText('+15550001000', 'x'), { code: 'WHATSAPP_ERROR' });
+    assert.equal(calls.length, 1);
+  });
+
+  it('sends our message ID as biz_opaque_callback_data so status webhooks can find it', async () => {
+    meta = () => json(200, { messages: [{ id: 'wamid.T' }] });
+    await whatsAppService.sendText('+15550001000', 'x', '0b6a6f1e-4a8e-4c43-9a43-6d7a5d6a0c11');
+    assert.equal(calls[0]!.body.biz_opaque_callback_data, '0b6a6f1e-4a8e-4c43-9a43-6d7a5d6a0c11');
+    calls = [];
+    await whatsAppService.sendText('+15550001000', 'x');
+    assert.ok(!('biz_opaque_callback_data' in calls[0]!.body));
   });
 
   it('gives up after three attempts on a persistent rate limit', async () => {
@@ -336,7 +403,7 @@ describe('message persistence', { skip: !testDatabaseUrl }, () => {
 
   beforeEach(async () => {
     await pool!.query(`DELETE FROM webhook_events WHERE source = 'whatsapp'`);
-    await pool!.query(`DELETE FROM customers WHERE phone_number LIKE '+1555000%'`);
+    await pool!.query(`DELETE FROM customers WHERE phone_number LIKE '+15550001%'`);
   });
 
   it('saves the customer, an open conversation, the message and the webhook event', async () => {

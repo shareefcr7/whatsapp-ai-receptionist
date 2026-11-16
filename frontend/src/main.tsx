@@ -1,16 +1,23 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
-import { BrowserRouter, Navigate, Route, Routes } from 'react-router';
+import { BrowserRouter, Navigate, Route, Routes, useParams } from 'react-router';
 import { Layout } from './components/Layout';
 import './index.css';
 import { AuthGate } from './lib/auth';
 import { Appointments, Conversations, Leads } from './pages/ListPages';
 import { BusinessInformation } from './pages/BusinessInformation';
+import { ConversationDetail } from './pages/ConversationDetail';
 import { NotFound } from './pages/NotFound';
 import { Overview } from './pages/Overview';
 import { Services } from './pages/Services';
 import { Settings } from './pages/Settings';
 import { UsageCosts } from './pages/UsageCosts';
+
+/** A fresh page per conversation: a draft, notice or error from one can never show on another. */
+function ConversationRoute() {
+  const { id } = useParams();
+  return <ConversationDetail key={id} />;
+}
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
@@ -21,6 +28,7 @@ createRoot(document.getElementById('root')!).render(
           <Route element={<Layout />}>
             <Route index element={<Overview />} />
             <Route path="conversations" element={<Conversations />} />
+            <Route path="conversations/:id" element={<ConversationRoute />} />
             <Route path="leads" element={<Leads />} />
             <Route path="appointments" element={<Appointments />} />
             <Route path="business-information" element={<BusinessInformation />} />
