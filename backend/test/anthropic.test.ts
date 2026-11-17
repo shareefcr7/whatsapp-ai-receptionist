@@ -28,7 +28,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   globalThis.fetch = realFetch;
-  Object.assign(env, { AI_PROVIDER: 'anthropic', ANTHROPIC_API_KEY: KEY, ANTHROPIC_MODEL: 'claude-sonnet-5-5' });
+  Object.assign(env, { AI_PROVIDER: 'anthropic', ANTHROPIC_API_KEY: KEY, ANTHROPIC_MODEL: 'claude-sonnet-5-5', OPENAI_API_KEY: undefined });
 });
 
 // retry-after-ms: 0 keeps the SDK's automatic retries instant.
@@ -56,11 +56,34 @@ describe('Anthropic provider selection and configuration', () => {
     assert.deepEqual(aiProvider(), { provider: 'anthropic', model: 'claude-sonnet-5-5' });
   });
 
-  it('the dashboard status reports the selected provider and its key only', () => {
-    assert.deepEqual(integrationStatus().ai, { implementation: 'ready', credentials: 'present_untested', connected: false, provider: 'anthropic' });
+  it('the dashboard status reports the selected provider, its model and its key only', () => {
+    assert.deepEqual(integrationStatus().ai, {
+      implementation: 'ready', credentials: 'present_untested', connected: false, provider: 'anthropic', model: 'claude-sonnet-5-5',
+    });
+    env.ANTHROPIC_MODEL = 'claude-sonnet-4-6';
+    assert.equal(integrationStatus().ai.model, 'claude-sonnet-4-6');
     env.ANTHROPIC_API_KEY = undefined;
     assert.equal(integrationStatus().ai.credentials, 'missing');
     assert.ok(!JSON.stringify(integrationStatus()).includes(KEY));
+  });
+
+  it('a key for the other provider never makes the selected one look configured', () => {
+    const OPENAI_KEY = 'sk-openai-test-not-a-real-key';
+    // Anthropic selected, only an OpenAI key: still Anthropic, still missing.
+    Object.assign(env, { ANTHROPIC_API_KEY: undefined, OPENAI_API_KEY: OPENAI_KEY });
+    assert.deepEqual(
+      (({ provider, credentials }) => ({ provider, credentials }))(integrationStatus().ai),
+      { provider: 'anthropic', credentials: 'missing' },
+    );
+    // OpenAI selected: its own key decides, and the model is OpenAI's.
+    Object.assign(env, { AI_PROVIDER: 'openai', ANTHROPIC_API_KEY: KEY });
+    assert.deepEqual(integrationStatus().ai, {
+      implementation: 'ready', credentials: 'present_untested', connected: false, provider: 'openai', model: env.OPENAI_MODEL,
+    });
+    env.OPENAI_API_KEY = undefined;
+    assert.equal(integrationStatus().ai.credentials, 'missing'); // the Anthropic key does not count
+    assert.ok(!JSON.stringify(integrationStatus()).includes(KEY));
+    assert.ok(!JSON.stringify(integrationStatus()).includes(OPENAI_KEY));
   });
 });
 

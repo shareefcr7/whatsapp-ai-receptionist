@@ -24,9 +24,10 @@ export function integrationItems(index: ApiIndex | undefined, google?: GoogleCal
   return (Object.keys(NAMES) as (keyof typeof NAMES)[]).map((key) => {
     if (key === 'googleCalendar' && google) return googleItem(google);
     const integration = index?.integrations[key];
-    const provider = key === 'ai' ? index?.integrations.ai.provider : undefined;
+    // Provider and model come from the backend's configuration, never assumed here.
+    const ai = key === 'ai' ? index?.integrations.ai : undefined;
     return {
-      label: provider ? `${NAMES[key]} (${PROVIDERS[provider]})` : NAMES[key],
+      label: ai ? `${NAMES[key]} (${PROVIDERS[ai.provider]}${ai.model ? ` · ${ai.model}` : ''})` : NAMES[key],
       tone: 'neutral',
       detail: !integration
         ? 'Unknown'

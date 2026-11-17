@@ -43,4 +43,22 @@ describe('integration status items', () => {
     assert.equal(integrationItems(openai)[1]!.label, 'AI replies (OpenAI)');
     assert.equal(integrationItems(undefined)[1]!.label, 'AI replies');
   });
+
+  const withAi = (ai: NonNullable<ApiIndex['integrations']['ai']>): ApiIndex => ({ ...index, integrations: { ...index.integrations, ai } });
+
+  it('shows the configured model, and missing credentials under the selected provider only', () => {
+    const claude = integrationItems(withAi({ ...ready, provider: 'anthropic', model: 'claude-sonnet-4-6' }))[1]!;
+    assert.deepEqual(claude, { label: 'AI replies (Claude · claude-sonnet-4-6)', tone: 'neutral', detail: 'Built · not in use until WhatsApp is connected' });
+    const missing = integrationItems(withAi({ ...ready, credentials: 'missing', provider: 'anthropic', model: 'claude-sonnet-4-6' }))[1]!;
+    assert.equal(missing.label, 'AI replies (Claude · claude-sonnet-4-6)'); // not OpenAI
+    assert.equal(missing.detail, 'Not connected · credentials missing');
+    const gpt = integrationItems(withAi({ ...ready, credentials: 'missing', provider: 'openai', model: 'gpt-4.1-mini' }))[1]!;
+    assert.equal(gpt.label, 'AI replies (OpenAI · gpt-4.1-mini)');
+  });
+
+  it('an older backend without the ai entry shows Unknown instead of crashing', () => {
+    const { ai: _ai, ...rest } = index.integrations;
+    const [, ai] = integrationItems({ ...index, integrations: rest as ApiIndex['integrations'] });
+    assert.deepEqual(ai, { label: 'AI replies', tone: 'neutral', detail: 'Unknown' });
+  });
 });

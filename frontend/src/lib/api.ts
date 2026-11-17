@@ -131,7 +131,10 @@ export interface GoogleCalendarStatus {
 export interface ApiIndex {
   name: string;
   environment: string;
-  integrations: Record<'whatsapp' | 'googleCalendar', IntegrationStatus> & { ai: IntegrationStatus & { provider: 'openai' | 'anthropic' } };
+  integrations: Record<'whatsapp' | 'googleCalendar', IntegrationStatus> & {
+    // Optional: an older backend (mid-deploy) sends no `ai` entry, or one without `model`.
+    ai?: IntegrationStatus & { provider: 'openai' | 'anthropic'; model?: string };
+  };
 }
 
 export interface DatabaseHealth {

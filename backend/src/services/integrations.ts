@@ -1,4 +1,5 @@
 import { env } from '../config/env.ts';
+import { aiProvider } from './ai/index.ts';
 
 /**
  * Reports only whether credentials are present. Nothing is ever "connected" until a
@@ -21,8 +22,9 @@ export function integrationStatus() {
       env.WHATSAPP_VERIFY_TOKEN,
       env.WHATSAPP_APP_SECRET,
     ], 'ready'),
-    // The provider AI_PROVIDER selects. Ready means the code exists; it only runs once WhatsApp delivers messages to it.
-    ai: { ...status([env.AI_PROVIDER === 'anthropic' ? env.ANTHROPIC_API_KEY : env.OPENAI_API_KEY], 'ready'), provider: env.AI_PROVIDER },
+    // The provider AI_PROVIDER selects, its model, and whether that provider's key is set (never the key itself).
+    // Ready means the code exists; it only runs once WhatsApp delivers messages to it.
+    ai: { ...status([env.AI_PROVIDER === 'anthropic' ? env.ANTHROPIC_API_KEY : env.OPENAI_API_KEY], 'ready'), ...aiProvider() },
     // Whether it is actually connected comes from /api/integrations/google/status, which reads the database.
     googleCalendar: status([env.GOOGLE_CLIENT_ID, env.GOOGLE_CLIENT_SECRET, env.GOOGLE_REDIRECT_URI, env.GOOGLE_TOKEN_ENCRYPTION_KEY], 'ready'),
   };
