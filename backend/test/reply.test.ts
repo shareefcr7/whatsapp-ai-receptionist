@@ -1,4 +1,4 @@
-// AI auto-reply. OpenAI and Meta are mocked through fetch: no test contacts either, and nothing is billed.
+// AI auto-reply. OpenAI, Anthropic and Meta are mocked through fetch: no test contacts any of them, and nothing is billed.
 // Persistence tests need TEST_DATABASE_URL (a DISPOSABLE database).
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
@@ -43,6 +43,8 @@ const realFetch = globalThis.fetch;
 let openaiCalls: Call[] = [];
 let metaCalls: Call[] = [];
 let openai: (call: Call) => Response | Promise<Response>;
+let anthropicCalls: Call[] = [];
+let anthropic: (call: Call) => Response | Promise<Response>;
 let meta: (call: Call) => Response | Promise<Response>;
 globalThis.fetch = (async (input: string | URL, init: RequestInit = {}) => {
   const url = new URL(String(input));
@@ -51,6 +53,10 @@ globalThis.fetch = (async (input: string | URL, init: RequestInit = {}) => {
   if (url.hostname === 'api.openai.com') {
     openaiCalls.push(call);
     return openai(call);
+  }
+  if (url.hostname === 'api.anthropic.com') {
+    anthropicCalls.push(call);
+    return anthropic(call);
   }
   if (url.hostname === 'graph.facebook.com') {
     metaCalls.push(call);
@@ -114,6 +120,10 @@ beforeEach(() => {
   metaCalls = [];
   openai = () => {
     throw new Error('unexpected OpenAI call');
+  };
+  anthropicCalls = [];
+  anthropic = () => {
+    throw new Error('unexpected Anthropic call');
   };
   meta = () => {
     throw new Error('unexpected Meta call');
@@ -233,6 +243,32 @@ describe('auto-reply (database)', { skip: !testDatabaseUrl }, () => {
       { provider: 'whatsapp', operation: 'send_text', model: null, input_tokens: 0, output_tokens: 0, units: 1, message_id: out.id },
     ]);
     assert.deepEqual(await handoversOf(cv.id), []);
+  });
+
+  it('AI_PROVIDER=anthropic: Claude answers through the same workflow, usage is recorded as anthropic, and the daily limits count both providers', async (t) => {
+    t.mock.method(console, 'info', () => {});
+    Object.assign(env, { AI_PROVIDER: 'anthropic', ANTHROPIC_API_KEY: 'sk-ant-test-not-a-real-key', ANTHROPIC_MODEL: 'claude-sonnet-5-5' });
+    t.after(() => Object.assign(env, { AI_PROVIDER: 'openai', ANTHROPIC_API_KEY: undefined }));
+    anthropic = () =>
+      new Response(
+        JSON.stringify({ id: 'msg_1', type: 'message', role: 'assistant', model: 'claude-sonnet-5-5', content: [{ type: 'text', text: 'We open at 9.' }], stop_reason: 'end_turn', usage: { input_tokens: 200, output_tokens: 30 } }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    meta = metaAccepts;
+
+    assert.deepEqual(await replyToMessages(await receive(text('15550002090', 'When do you open?'))), ['sent']);
+    assert.deepEqual([anthropicCalls.length, openaiCalls.length], [1, 0]);
+    assert.deepEqual(anthropicCalls[0]!.body.messages, [{ role: 'user', content: 'When do you open?' }]);
+    const cv = await conversationOf('+15550002090');
+    const out = (await messagesOf(cv.id)).at(-1)!;
+    assert.deepEqual([out.sender_type, out.content, out.status], ['ai', 'We open at 9.', 'sent']);
+    assert.deepEqual((await usageOf(cv.id))[0], { provider: 'anthropic', operation: 'chat_completion', model: 'claude-sonnet-5-5', input_tokens: 200, output_tokens: 30, units: 1, message_id: out.id });
+
+    // An earlier OpenAI call by the same customer counts towards the per-customer limit too.
+    await q(`INSERT INTO usage_logs (provider, operation, conversation_id) VALUES ('openai', 'chat_completion', $1)`, [cv.id]);
+    env.AI_CUSTOMER_DAILY_REPLY_LIMIT = 2;
+    assert.deepEqual(await replyToMessages(await receive(text('15550002090', 'And on Sunday?'))), ['limit_reached']);
+    assert.equal(anthropicCalls.length, 1);
   });
 
   it('sends the latest 20 text messages as context, oldest first, without media or failed replies', async (t) => {

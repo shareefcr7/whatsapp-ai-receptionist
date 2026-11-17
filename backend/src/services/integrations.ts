@@ -21,8 +21,8 @@ export function integrationStatus() {
       env.WHATSAPP_VERIFY_TOKEN,
       env.WHATSAPP_APP_SECRET,
     ], 'ready'),
-    // Ready means the code exists; it only runs once WhatsApp delivers messages to it.
-    openai: status([env.OPENAI_API_KEY], 'ready'),
+    // The provider AI_PROVIDER selects. Ready means the code exists; it only runs once WhatsApp delivers messages to it.
+    ai: { ...status([env.AI_PROVIDER === 'anthropic' ? env.ANTHROPIC_API_KEY : env.OPENAI_API_KEY], 'ready'), provider: env.AI_PROVIDER },
     // Whether it is actually connected comes from /api/integrations/google/status, which reads the database.
     googleCalendar: status([env.GOOGLE_CLIENT_ID, env.GOOGLE_CLIENT_SECRET, env.GOOGLE_REDIRECT_URI, env.GOOGLE_TOKEN_ENCRYPTION_KEY], 'ready'),
   };

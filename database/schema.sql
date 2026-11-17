@@ -167,7 +167,7 @@ CREATE INDEX handover_logs_status_idx ON handover_logs (status);
 
 CREATE TABLE usage_logs (
   id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  provider         text NOT NULL CHECK (provider IN ('openai', 'whatsapp', 'google_calendar')),
+  provider         text NOT NULL CHECK (provider IN ('openai', 'anthropic', 'whatsapp', 'google_calendar')),
   operation        text NOT NULL,
   model            text,
   input_tokens     integer NOT NULL DEFAULT 0 CHECK (input_tokens >= 0),

@@ -351,7 +351,7 @@ describe('with PostgreSQL', { skip: !testDatabaseUrl }, () => {
     const { status, body } = await get('/health/database');
     assert.equal(status, 200);
     assert.equal(body.data.status, 'connected');
-    assert.equal(body.data.migrationsApplied, 5);
+    assert.equal(body.data.migrationsApplied, 6);
   });
 
   it('a fresh database returns identified empty states', async () => {

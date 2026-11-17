@@ -131,7 +131,7 @@ export interface GoogleCalendarStatus {
 export interface ApiIndex {
   name: string;
   environment: string;
-  integrations: Record<'whatsapp' | 'openai' | 'googleCalendar', IntegrationStatus>;
+  integrations: Record<'whatsapp' | 'googleCalendar', IntegrationStatus> & { ai: IntegrationStatus & { provider: 'openai' | 'anthropic' } };
 }
 
 export interface DatabaseHealth {

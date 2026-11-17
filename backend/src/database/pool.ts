@@ -26,6 +26,9 @@ export const pool = env.DATABASE_URL
       max: 10,
       connectionTimeoutMillis: 5_000,
       idleTimeoutMillis: 30_000,
+      // TCP keepalive probes, so a connection silently dropped by a network hop (e.g. to an external database host) is
+      // detected instead of hanging the next query on it.
+      keepAlive: true,
       // Sent as a startup parameter when each connection opens: no session SET that could linger in the pool.
       statement_timeout: env.DB_STATEMENT_TIMEOUT_MS,
     })

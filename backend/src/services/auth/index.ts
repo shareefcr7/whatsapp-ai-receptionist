@@ -1,7 +1,7 @@
 import { createHash, randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
 import type { ScryptOptions } from 'node:crypto';
 import { promisify } from 'node:util';
-import { query } from '../../database/pool.ts';
+import { concurrencyLimit, query } from '../../database/pool.ts';
 import { AppError } from '../../types/errors.ts';
 
 export interface Staff {
@@ -16,9 +16,21 @@ const SCRYPT = { N: 2 ** 17, r: 8, p: 1 }; // OWASP's recommended minimum
 const KEY_LENGTH = 64;
 const scryptOptions = (s: typeof SCRYPT) => ({ ...s, maxmem: 256 * s.N * s.r });
 
+/**
+ * Each hash at the default cost holds 128 MiB (128 * N * r) while it runs, and Node runs up to four at once (the libuv
+ * thread pool), so a burst of sign-in requests could need 512 MiB and crash a small instance. Every scrypt call
+ * (hash, verify, and the decoy for unknown emails) waits for one of these slots, so known and unknown emails still
+ * take the same path and the same time. Waiting requests hold no hash memory.
+ * ponytail: the queue is unbounded, so a long burst delays real sign-ins (but cannot crash the process); add a queue cap
+ * returning 503 if that is seen.
+ */
+export const MAX_CONCURRENT_HASHES = 2;
+export const withHashSlot = concurrencyLimit(MAX_CONCURRENT_HASHES);
+const scryptLimited: typeof scryptAsync = (...args) => withHashSlot(() => scryptAsync(...args));
+
 export async function hashPassword(password: string): Promise<string> {
   const salt = randomBytes(16);
-  const key = await scryptAsync(password, salt, KEY_LENGTH, scryptOptions(SCRYPT));
+  const key = await scryptLimited(password, salt, KEY_LENGTH, scryptOptions(SCRYPT));
   return `scrypt$${SCRYPT.N}$${SCRYPT.r}$${SCRYPT.p}$${salt.toString('base64url')}$${key.toString('base64url')}`;
 }
 
@@ -28,7 +40,7 @@ export async function verifyPassword(password: string, stored: string): Promise<
   if (scheme !== 'scrypt' || !N || !r || !p || !salt || !key) return false;
   const expected = Buffer.from(key, 'base64url');
   const params = { N: Number(N), r: Number(r), p: Number(p) };
-  const actual = await scryptAsync(password, Buffer.from(salt, 'base64url'), expected.length, scryptOptions(params));
+  const actual = await scryptLimited(password, Buffer.from(salt, 'base64url'), expected.length, scryptOptions(params));
   return timingSafeEqual(actual, expected);
 }
 

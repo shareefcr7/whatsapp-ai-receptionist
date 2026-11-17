@@ -1,6 +1,11 @@
 import { z } from 'zod';
 
 // `KEY=` in a .env file arrives as '', which means "not set".
+/** Trimmed and lower-cased; blank or whitespace-only means "not set", so the default applies. */
+const blankToUndefined = (v: unknown) => {
+  const s = typeof v === 'string' ? v.trim().toLowerCase() : v;
+  return s === '' ? undefined : s;
+};
 const optional = z.preprocess((v) => (v === '' ? undefined : v), z.string().optional());
 
 const schema = z
@@ -9,18 +14,31 @@ const schema = z
     PORT: z.coerce.number().int().min(1).max(65535).default(4000),
     HOST: z.preprocess((v) => (v === '' ? undefined : v), z.string().default('127.0.0.1')),
     FRONTEND_URL: optional,
+    // Shared with the dashboard's Vercel proxy (BACKEND_PROXY_SECRET there). Every route except health and the WhatsApp
+    // webhook needs it, so the backend cannot be used directly. Required in production.
+    VERCEL_PROXY_SECRET: z.preprocess(
+      (v) => (v === '' ? undefined : v),
+      z.string().regex(/^[\x21-\x7e]{32,}$/, 'must be at least 32 printable characters, without spaces').optional(),
+    ),
     DATABASE_URL: z.preprocess(
       (v) => (v === '' ? undefined : v),
       z.url({ protocol: /^postgres(ql)?$/, error: 'must be a postgres:// or postgresql:// URL' }).optional(),
     ),
+    // Which provider answers customers. Blank = openai, so an existing deployment keeps its behaviour until this is set.
+    AI_PROVIDER: z.preprocess(
+      blankToUndefined,
+      z.enum(['openai', 'anthropic'], { error: 'must be "openai" or "anthropic"' }).default('openai'),
+    ),
     OPENAI_API_KEY: optional,
     OPENAI_MODEL: z.preprocess((v) => (v === '' ? undefined : v), z.string().default('gpt-4.1-mini')),
+    ANTHROPIC_API_KEY: optional,
+    ANTHROPIC_MODEL: z.preprocess((v) => (v === '' ? undefined : v), z.string().default('claude-sonnet-5-5')),
     // Off unless exactly "true": a typo fails startup instead of silently enabling paid replies.
     AI_AUTO_REPLY_ENABLED: z.preprocess(
-      (v) => (v === '' ? undefined : typeof v === 'string' ? v.trim().toLowerCase() : v),
+      blankToUndefined,
       z.enum(['true', 'false'], { error: 'must be "true" or "false"' }).default('false').transform((v) => v === 'true'),
     ),
-    // OpenAI calls allowed in any rolling 24 hours, in total and per customer. 0 stops AI replies.
+    // AI calls (either provider) allowed in any rolling 24 hours, in total and per customer. 0 stops AI replies.
     AI_DAILY_REPLY_LIMIT: z.preprocess((v) => (v === '' ? undefined : v), z.coerce.number().int().min(0).max(100_000).default(200)),
     AI_CUSTOMER_DAILY_REPLY_LIMIT: z.preprocess((v) => (v === '' ? undefined : v), z.coerce.number().int().min(0).max(1_000).default(20)),
     // Server-side limit on any one database statement, so a slow or stuck query cannot hold a conversation lock or a
@@ -50,7 +68,7 @@ const schema = z
   })
   .superRefine((env, ctx) => {
     if (env.NODE_ENV !== 'production') return;
-    for (const key of ['DATABASE_URL', 'FRONTEND_URL'] as const) {
+    for (const key of ['DATABASE_URL', 'FRONTEND_URL', 'VERCEL_PROXY_SECRET'] as const) {
       if (!env[key]) ctx.addIssue({ code: 'custom', path: [key], message: 'is required in production' });
     }
   });

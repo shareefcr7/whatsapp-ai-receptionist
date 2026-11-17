@@ -81,7 +81,9 @@ export const apiIndex: RequestHandler = (_req, res) => {
 
 export const login: RequestHandler = async (req, res) => {
   const { email, password } = loginSchema.parse(req.body);
-  const { token, expiresAt, staff } = await startSession(email, password, req.ip ?? 'unknown');
+  // Set by requireProxy for every route but health and the webhook; never a forwarded header.
+  if (!req.clientIp) throw new AppError(403, 'PROXY_AUTH_REQUIRED', 'Use the dashboard address.');
+  const { token, expiresAt, staff } = await startSession(email, password, req.clientIp);
   res.set('Cache-Control', 'no-store');
   res.cookie(sessionCookie.name, token, sessionCookie.options(expiresAt));
   ok(res, staff);

@@ -4,7 +4,7 @@ import { inTransaction, isDatabaseConfigured, query, requirePool, transaction } 
 import { AppError } from '../../types/errors.ts';
 import { deliver, withConversationSend } from '../conversations/index.ts';
 import type { ReceivedMessage } from '../whatsapp/webhook.ts';
-import { aiService, loadBusinessKnowledge } from './index.ts';
+import { aiProvider, aiService, loadBusinessKnowledge } from './index.ts';
 import type { AiReply } from './index.ts';
 
 const HISTORY_LIMIT = 20;
@@ -102,25 +102,26 @@ const handOver = (conversationId: string, reason: string) =>
   );
 
 /**
- * Reserves one OpenAI call against the rolling 24-hour limits by inserting its usage_logs row up front. A global
+ * Reserves one AI call (either provider) against the rolling 24-hour limits by inserting its usage_logs row up front. A global
  * advisory lock makes count-and-insert atomic, so concurrent requests (on any server) cannot overshoot.
  */
 function reserveAiCall(conversationId: string): Promise<{ usageId: string } | { limit: 'customer' | 'daily' }> {
+  const { provider, model } = aiProvider();
   return inTransaction(async (c) => {
     await c.query('SELECT pg_advisory_xact_lock(2, 0)');
     const { rows: [n] } = await c.query<{ total: number; customer: number }>(
       `SELECT count(*)::int AS total,
               count(*) FILTER (WHERE cv.customer_id = (SELECT customer_id FROM conversations WHERE id = $1))::int AS customer
        FROM usage_logs u LEFT JOIN conversations cv ON cv.id = u.conversation_id
-       WHERE u.provider = 'openai' AND u.occurred_at > clock_timestamp() - interval '24 hours'`,
+       WHERE u.provider IN ('openai', 'anthropic') AND u.occurred_at > clock_timestamp() - interval '24 hours'`,
       [conversationId],
     );
     if (n!.customer >= env.AI_CUSTOMER_DAILY_REPLY_LIMIT) return { limit: 'customer' as const };
     if (n!.total >= env.AI_DAILY_REPLY_LIMIT) return { limit: 'daily' as const };
     const { rows: [row] } = await c.query<{ id: string }>(
       `INSERT INTO usage_logs (provider, operation, model, conversation_id, occurred_at)
-       VALUES ('openai', 'chat_completion', $2, $1, clock_timestamp()) RETURNING id`,
-      [conversationId, env.OPENAI_MODEL],
+       VALUES ($3, 'chat_completion', $2, $1, clock_timestamp()) RETURNING id`,
+      [conversationId, model, provider],
     );
     return { usageId: row!.id };
   });
@@ -132,7 +133,7 @@ function reserveAiCall(conversationId: string): Promise<{ usageId: string } | { 
  */
 function sendReply(conversationId: string, messageId: string, reply: AiReply, usageId: string) {
   return withConversationSend(conversationId, async (c): Promise<{ outcome: ReplyOutcome; failure?: string }> => {
-    // Re-read under the lock: staff, an opt-out or a newer message may have arrived while OpenAI was answering.
+    // Re-read under the lock: staff, an opt-out or a newer message may have arrived while the AI was answering.
     const target = await loadTarget(messageId, c);
     const late = skipReason(target);
     if (late) return { outcome: late };
@@ -158,7 +159,7 @@ async function replyTo(messageId: string): Promise<ReplyOutcome> {
   if (skip) return skip;
   const { conversationId, isStale } = target!;
   if (!target!.content?.trim()) {
-    await handOver(conversationId, MEDIA_HANDOVER_REASON); // no OpenAI call
+    await handOver(conversationId, MEDIA_HANDOVER_REASON); // no AI call
     return 'media_handover';
   }
   if (isStale) {
@@ -213,7 +214,7 @@ async function replyTo(messageId: string): Promise<ReplyOutcome> {
 }
 
 // ponytail: in-process queue keeps one reply per conversation in flight on this server. The conversation lock in
-// sendReply keeps sends safe across servers; a second server could still make a duplicate OpenAI call.
+// sendReply keeps sends safe across servers; a second server could still make a duplicate AI call.
 const queues = new Map<string, Promise<unknown>>();
 
 function enqueue<T>(key: string, task: () => Promise<T>): Promise<T> {
@@ -262,7 +263,7 @@ export async function replyToMessages(received: ReceivedMessage[]): Promise<Repl
 // --- Recovery: replies queued in memory are lost on a restart or deploy, and Meta's redelivery is a duplicate,
 // so nothing would ever answer them. This finds them and hands them to staff.
 
-/** Long enough for an in-flight reply on another server (OpenAI 30s + WhatsApp retries) to finish first. */
+/** Long enough for an in-flight reply on another server (AI call up to 30s with retries + WhatsApp retries) to finish first. */
 export const RECOVERY_GRACE_MINUTES = 5;
 const RECOVERY_INTERVAL_MS = 5 * 60_000;
 export const RECOVERY_REASON = 'No AI reply was recorded (recovered after a restart or error)';

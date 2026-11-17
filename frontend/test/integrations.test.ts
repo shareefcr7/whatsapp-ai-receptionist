@@ -4,7 +4,7 @@ import type { ApiIndex, GoogleCalendarStatus } from '../src/lib/api.ts';
 import { integrationItems } from '../src/lib/integrations.ts';
 
 const ready = { implementation: 'ready', credentials: 'present_untested', connected: false } as const;
-const index: ApiIndex = { name: 'API', environment: 'test', integrations: { whatsapp: ready, openai: ready, googleCalendar: ready } };
+const index: ApiIndex = { name: 'API', environment: 'test', integrations: { whatsapp: ready, ai: { ...ready, provider: 'anthropic' }, googleCalendar: ready } };
 const google = (over: Partial<GoogleCalendarStatus>): GoogleCalendarStatus => ({
   configured: true,
   missingConfig: [],
@@ -35,9 +35,12 @@ describe('integration status items', () => {
     assert.equal(integrationItems(undefined)[0]!.detail, 'Unknown');
   });
 
-  it('leaves WhatsApp and OpenAI unchanged', () => {
-    const [whatsapp, openai] = integrationItems(index, google({ status: 'connected' }));
+  it('leaves WhatsApp unchanged and names the selected AI provider', () => {
+    const [whatsapp, ai] = integrationItems(index, google({ status: 'connected' }));
     assert.equal(whatsapp!.detail, 'Built · not connected until Meta verifies the webhook');
-    assert.equal(openai!.detail, 'Built · not in use until WhatsApp is connected');
+    assert.deepEqual(ai, { label: 'AI replies (Claude)', tone: 'neutral', detail: 'Built · not in use until WhatsApp is connected' });
+    const openai = { ...index, integrations: { ...index.integrations, ai: { ...ready, provider: 'openai' as const } } };
+    assert.equal(integrationItems(openai)[1]!.label, 'AI replies (OpenAI)');
+    assert.equal(integrationItems(undefined)[1]!.label, 'AI replies');
   });
 });

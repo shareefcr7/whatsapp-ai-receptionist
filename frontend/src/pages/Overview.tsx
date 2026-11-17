@@ -150,7 +150,7 @@ export function Overview() {
         <Card title="API and system status">
           <StatusList items={[api, database, ...integrationItems(index.result?.data, google.result?.data)]} />
           <p className="border-t border-stone-100 px-5 py-3 text-xs text-stone-500">
-            WhatsApp webhook, OpenAI replies and Google Calendar are built. WhatsApp is not connected until Meta verifies the webhook; bookings do not use the calendar yet.
+            WhatsApp webhook, AI replies and Google Calendar are built. WhatsApp is not connected until Meta verifies the webhook; bookings do not use the calendar yet.
           </p>
         </Card>
       </div>
