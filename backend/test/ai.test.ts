@@ -37,8 +37,22 @@ describe('AI replies', () => {
     const reply = await ask();
     assert.equal(reply.text, 'A team member will help.');
     assert.equal(reply.requestsHandover, true);
+    respond(200, { choices: [{ message: { content: '[HANDOVER] Someone will call you.\n[HANDOVER]' } }] });
+    assert.equal((await ask()).text, 'Someone will call you.'); // every marker removed, not just the first
     respond(200, { choices: [{ message: { content: '' } }] });
     assert.equal((await ask()).requestsHandover, true);
+  });
+
+  it('a reply cut off at the token limit or filtered is not sent and hands over', async () => {
+    for (const finish_reason of ['length', 'content_filter']) {
+      respond(200, { choices: [{ message: { content: 'Our hours are 9 to' }, finish_reason }], usage: { prompt_tokens: 10, completion_tokens: 400 } });
+      const reply = await ask();
+      assert.equal(reply.text, '');
+      assert.equal(reply.requestsHandover, true);
+      assert.equal(reply.outputTokens, 400); // still billed, so still counted
+    }
+    respond(200, { choices: [{ message: { content: 'Open 9-5.' }, finish_reason: 'stop' }] });
+    assert.equal((await ask()).text, 'Open 9-5.');
   });
 
   it('forbids invented facts and booking confirmations', () => {

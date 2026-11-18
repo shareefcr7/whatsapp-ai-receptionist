@@ -1,10 +1,11 @@
 import { ChevronLeft, ChevronRight } from 'lucide-react';
-import { useSearchParams } from 'react-router';
+import { Link, useSearchParams } from 'react-router';
 import { Card, CustomerCell, DataStateNotice, DataTable, EmptyState, ErrorState, PageHeader, Skeleton, StatusBadge } from '../components/ui';
 import type { Column } from '../components/ui';
 import { useApi } from '../lib/api';
 import type { Appointment, Conversation, Lead } from '../lib/api';
 import { formatDateTime, formatStatus } from '../lib/format';
+import { HandledByBadge, OptedOutBadge } from './ConversationDetail';
 
 const PAGE_SIZE = 20;
 
@@ -96,10 +97,26 @@ export function Conversations() {
       statuses={['open', 'handover_requested', 'human_active', 'closed']}
       emptyDetail="Threads appear here once WhatsApp messaging is connected."
       columns={[
-        { header: 'Customer', cell: (c) => <CustomerCell name={c.customerName} phone={c.customerPhone} /> },
+        {
+          header: 'Customer',
+          cell: (c) => (
+            <Link to={`/conversations/${c.id}`} className="block rounded hover:text-brand-700 hover:underline" aria-label={`Open conversation with ${c.customerName ?? c.customerPhone}`}>
+              <CustomerCell name={c.customerName} phone={c.customerPhone} />
+            </Link>
+          ),
+        },
         { header: 'Last message', cell: (c) => <p className="line-clamp-2 max-w-sm text-stone-600">{c.lastMessage ?? '—'}</p> },
         { header: 'Messages', cell: (c) => <span className="tabular-nums">{c.messageCount}</span> },
-        { header: 'Status', cell: (c) => <StatusBadge status={c.status} /> },
+        {
+          header: 'Status',
+          cell: (c) => (
+            <div className="flex flex-col items-start gap-1">
+              <StatusBadge status={c.status} />
+              {c.optedOut && <OptedOutBadge />}
+            </div>
+          ),
+        },
+        { header: 'Handled by', cell: (c) => <HandledByBadge status={c.status} staffName={c.assignedStaffName} /> },
         { header: 'Last activity', cell: (c) => <span className="whitespace-nowrap text-stone-600">{formatDateTime(c.lastMessageAt)}</span> },
       ]}
     />

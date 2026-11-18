@@ -1,12 +1,10 @@
 {
+  "functions": {
+    "api/proxy.ts": { "maxDuration": 60 }
+  },
   "rewrites": [
-    {
-      "source": "/api/:path*",
-      "destination": "https://whatsapp-ai-receptionist-t681.onrender.com/api/:path*"
-    },
-    {
-      "source": "/(.*)",
-      "destination": "/index.html"
-    }
+    { "source": "/api", "destination": "/api/proxy" },
+    { "source": "/api/:path*", "destination": "/api/proxy" },
+    { "source": "/(.*)", "destination": "/index.html" }
   ]
 }

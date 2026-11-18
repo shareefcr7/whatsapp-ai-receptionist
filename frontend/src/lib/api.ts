@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
+import { failed, loaded } from './apiState';
+import type { LoadState } from './apiState';
 
 const BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
 
@@ -69,28 +71,34 @@ export const apiGet = <T>(path: string, signal?: AbortSignal) => apiRequest<T>(p
 
 export interface ApiState<T> {
   result: ApiResult<T> | null;
+  /** On a failed refresh, `result` still holds the last good data; pages that can keep showing it should. */
   error: ApiError | null;
+  /** When `result` was last loaded successfully. */
+  loadedAt: number | null;
   loading: boolean;
   refetch: () => void;
+  /** Fetches again but keeps showing the current data until the new data arrives (no loading flash). */
+  reload: () => void;
 }
 
 export function useApi<T>(path: string, pollMs?: number): ApiState<T> {
-  const [state, setState] = useState<{ path: string; result: ApiResult<T> | null; error: ApiError | null } | null>(null);
+  const [state, setState] = useState<LoadState<ApiResult<T>, ApiError> | null>(null);
   const [tick, setTick] = useState(0);
   const refetch = useCallback(() => {
     setState(null);
     setTick((t) => t + 1);
   }, []);
+  const reload = useCallback(() => setTick((t) => t + 1), []);
 
   useEffect(() => {
     const controller = new AbortController();
     const load = () =>
       apiGet<T>(path, controller.signal)
-        .then((result) => setState({ path, result, error: null }))
+        .then((result) => setState(loaded(path, result)))
         .catch((err: unknown) => {
           if (controller.signal.aborted) return;
           const error = err instanceof ApiError ? err : new ApiError(0, 'UNKNOWN', 'The request failed.');
-          setState({ path, result: null, error });
+          setState((prev) => failed(prev, path, error));
         });
     void load();
     const timer = pollMs ? setInterval(load, pollMs) : undefined;
@@ -102,7 +110,7 @@ export function useApi<T>(path: string, pollMs?: number): ApiState<T> {
 
   // A result for an older path is treated as loading, so a filter change never shows stale rows.
   const current = state?.path === path ? state : null;
-  return { result: current?.result ?? null, error: current?.error ?? null, loading: !current, refetch };
+  return { result: current?.result ?? null, error: current?.error ?? null, loadedAt: current?.loadedAt ?? null, loading: !current, refetch, reload };
 }
 
 export interface IntegrationStatus {
@@ -123,7 +131,10 @@ export interface GoogleCalendarStatus {
 export interface ApiIndex {
   name: string;
   environment: string;
-  integrations: Record<'whatsapp' | 'openai' | 'googleCalendar', IntegrationStatus>;
+  integrations: Record<'whatsapp' | 'googleCalendar', IntegrationStatus> & {
+    // Optional: an older backend (mid-deploy) sends no `ai` entry, or one without `model`.
+    ai?: IntegrationStatus & { provider: 'openai' | 'anthropic'; model?: string };
+  };
 }
 
 export interface DatabaseHealth {
@@ -141,6 +152,48 @@ export interface Conversation {
   lastMessageAt: string | null;
   lastMessage: string | null;
   messageCount: number;
+  optedOut: boolean;
+  assignedStaffName: string | null;
+}
+
+export type ConversationStatus = 'open' | 'handover_requested' | 'human_active' | 'closed';
+
+export interface ConversationMessage {
+  id: string;
+  direction: 'inbound' | 'outbound';
+  senderType: 'customer' | 'ai' | 'staff' | 'system';
+  messageType: string;
+  content: string | null;
+  status: string;
+  errorMessage: string | null;
+  createdAt: string;
+  /** Who sent a staff message (the signed-in sender, recorded by the server). */
+  staffName: string | null;
+}
+
+export type ConversationEventAction = 'staff_reply' | 'takeover' | 'reopen' | 'close' | 'reactivate';
+
+export interface ConversationEvent {
+  id: string;
+  action: ConversationEventAction;
+  staffName: string;
+  messageId: string | null;
+  createdAt: string;
+}
+
+export interface ConversationDetail {
+  id: string;
+  customerName: string | null;
+  customerPhone: string;
+  status: ConversationStatus;
+  lastMessageAt: string | null;
+  optedOut: boolean;
+  optedOutAt: string | null;
+  assignedStaffName: string | null;
+  handoverReason: string | null;
+  messages: ConversationMessage[];
+  /** Audit trail of staff actions, oldest first. */
+  events: ConversationEvent[];
 }
 
 export interface Lead {

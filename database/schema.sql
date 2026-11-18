@@ -84,14 +84,19 @@ CREATE TABLE messages (
   message_type         text NOT NULL DEFAULT 'text',
   content              text,
   whatsapp_message_id  text UNIQUE, -- NULL until WhatsApp assigns one; NULLs do not conflict
+  -- 'unknown' (004): WhatsApp did not confirm the send; it may have reached the customer.
   status               text NOT NULL DEFAULT 'received'
-                       CHECK (status IN ('received', 'queued', 'sent', 'delivered', 'read', 'failed')),
+                       CONSTRAINT messages_status_check
+                       CHECK (status IN ('received', 'queued', 'sent', 'delivered', 'read', 'failed', 'unknown')),
   error_message        text,
+  staff_id             uuid REFERENCES staff_users (id), -- 004: the signed-in sender of a staff message
+  client_message_id    uuid UNIQUE, -- 004: dashboard per-draft key, so a repeated submission does not send twice
   created_at           timestamptz NOT NULL DEFAULT now(),
   updated_at           timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX messages_conversation_created_idx ON messages (conversation_id, created_at);
 CREATE INDEX messages_created_at_idx ON messages (created_at);
+CREATE INDEX messages_staff_id_idx ON messages (staff_id);
 
 CREATE TABLE leads (
   id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -162,7 +167,7 @@ CREATE INDEX handover_logs_status_idx ON handover_logs (status);
 
 CREATE TABLE usage_logs (
   id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  provider         text NOT NULL CHECK (provider IN ('openai', 'whatsapp', 'google_calendar')),
+  provider         text NOT NULL CHECK (provider IN ('openai', 'anthropic', 'whatsapp', 'google_calendar')),
   operation        text NOT NULL,
   model            text,
   input_tokens     integer NOT NULL DEFAULT 0 CHECK (input_tokens >= 0),
@@ -246,3 +251,32 @@ CREATE TABLE google_calendar_connection (
 );
 CREATE TRIGGER google_calendar_connection_set_updated_at BEFORE UPDATE ON google_calendar_connection
   FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- 004_delivery_unknown_and_audit: append-only audit trail of staff actions.
+CREATE TABLE conversation_events (
+  id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, -- also the order events happened in
+  -- 005: RESTRICT, so deleting a conversation or message with audit history fails instead of erasing it.
+  conversation_id  uuid NOT NULL CONSTRAINT conversation_events_conversation_id_fkey REFERENCES conversations (id) ON DELETE RESTRICT,
+  staff_id         uuid NOT NULL REFERENCES staff_users (id),
+  action           text NOT NULL CHECK (action IN ('staff_reply', 'takeover', 'reopen', 'close', 'reactivate')),
+  message_id       uuid CONSTRAINT conversation_events_message_id_fkey REFERENCES messages (id) ON DELETE RESTRICT,
+  created_at       timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX conversation_events_conversation_idx ON conversation_events (conversation_id, id);
+CREATE INDEX conversation_events_staff_id_idx ON conversation_events (staff_id);
+-- 005: no UPDATE, DELETE or TRUNCATE, except in a transaction that sets receptionist.audit_maintenance = 'on'
+-- (the documented customer-erasure procedure in 005_audit_integrity.sql; the app never sets it).
+CREATE FUNCTION conversation_events_append_only() RETURNS trigger AS $$
+BEGIN
+  IF current_setting('receptionist.audit_maintenance', true) = 'on' THEN
+    RETURN COALESCE(NEW, OLD); -- maintenance only; NULL for the statement-level TRUNCATE trigger
+  END IF;
+  RAISE EXCEPTION 'conversation_events is append-only (% refused)', TG_OP;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER conversation_events_no_update BEFORE UPDATE ON conversation_events
+  FOR EACH ROW EXECUTE FUNCTION conversation_events_append_only();
+CREATE TRIGGER conversation_events_no_delete BEFORE DELETE ON conversation_events
+  FOR EACH ROW EXECUTE FUNCTION conversation_events_append_only();
+CREATE TRIGGER conversation_events_no_truncate BEFORE TRUNCATE ON conversation_events
+  FOR EACH STATEMENT EXECUTE FUNCTION conversation_events_append_only();

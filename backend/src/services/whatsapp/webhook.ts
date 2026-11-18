@@ -1,6 +1,6 @@
 import type { PoolClient } from 'pg';
 import { env } from '../../config/env.ts';
-import { requirePool } from '../../database/pool.ts';
+import { inTransaction } from '../../database/pool.ts';
 
 // The subset of Meta's webhook payload this code reads. Everything else is ignored.
 export interface WaMessage {
@@ -15,10 +15,12 @@ export interface WaMessage {
   video?: { caption?: string };
   document?: { caption?: string };
 }
-interface WaStatus {
+export interface WaStatus {
   id: string;
   status: string;
   errors?: { code?: number; title?: string }[];
+  /** Our outbound message ID, sent with the message and echoed back by Meta. */
+  biz_opaque_callback_data?: string;
 }
 interface WaValue {
   metadata?: { phone_number_id?: string };
@@ -33,10 +35,25 @@ export interface WebhookPayload {
 
 type Outcome = 'processed' | 'duplicate' | 'ignored' | 'failed';
 export type WebhookResult = Record<Outcome, number>;
+/** Counts for Meta, plus the IDs of inbound messages saved by this delivery (never redeliveries), for internal use only. */
+export interface ReceivedMessage {
+  messageId: string;
+  conversationId: string;
+}
+export type WebhookOutcome = WebhookResult & { received: ReceivedMessage[] };
 
 const E164 = /^\+[1-9][0-9]{6,14}$/;
 // Statuses arrive out of order; a late "delivered" must not overwrite "read".
 const STATUS_ORDER = ['queued', 'sent', 'delivered', 'read'];
+
+// Whole-message matches only, so "stop by tomorrow?" is not an opt-out. CANCEL is left out: customers use it for appointments.
+const OPT_OUT_KEYWORDS = new Set(['stop', 'stop all', 'stopall', 'unsubscribe', 'opt out', 'opt-out', 'optout', 'end', 'quit']);
+
+/** True when the whole message asks to stop messages, ignoring case, spacing and trailing punctuation. */
+export function isOptOut(text: string | null): boolean {
+  if (!text) return false;
+  return OPT_OUT_KEYWORDS.has(text.trim().toLowerCase().replace(/\s+/g, ' ').replace(/[\s.!]+$/, ''));
+}
 
 /** The readable text of a message, or null for media without a caption, locations, stickers and unknown types. */
 export function messageText(m: WaMessage): string | null {
@@ -53,21 +70,6 @@ export function messageText(m: WaMessage): string | null {
       return m[m.type]?.caption ?? null;
     default:
       return null;
-  }
-}
-
-async function inTransaction<T>(fn: (c: PoolClient) => Promise<T>): Promise<T> {
-  const client = await requirePool().connect();
-  try {
-    await client.query('BEGIN');
-    const result = await fn(client);
-    await client.query('COMMIT');
-    return result;
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
-    throw err;
-  } finally {
-    client.release();
   }
 }
 
@@ -100,14 +102,14 @@ async function openConversation(c: PoolClient, customerId: string): Promise<stri
   throw new Error('Could not open a conversation');
 }
 
-function handleMessage(m: WaMessage, profileName: string | undefined): Promise<Outcome> {
+function handleMessage(m: WaMessage, profileName: string | undefined): Promise<{ outcome: Outcome; received?: ReceivedMessage }> {
   return inTransaction(async (c) => {
     const eventId = await recordEvent(c, `message:${m.id}`, `message.${m.type}`, m);
-    if (!eventId) return 'duplicate';
+    if (!eventId) return { outcome: 'duplicate' };
     const phone = `+${m.from}`;
     if (!E164.test(phone)) {
       await finish(c, eventId, 'failed', 'Sender is not a valid international phone number.');
-      return 'failed';
+      return { outcome: 'failed' };
     }
     const seconds = Number(m.timestamp);
     const sentAt = Number.isFinite(seconds) && seconds > 0 ? new Date(seconds * 1000) : new Date();
@@ -119,10 +121,14 @@ function handleMessage(m: WaMessage, profileName: string | undefined): Promise<O
       [phone, profileName?.slice(0, 200) || null],
     );
     const conversationId = await openConversation(c, rows[0]!.id);
-    await c.query(
+    // Only staff can undo this (POST /api/conversations/:id/reactivate); no keyword re-subscribes.
+    if (isOptOut(messageText(m))) {
+      await c.query(`UPDATE customers SET opted_out_at = COALESCE(opted_out_at, now()) WHERE id = $1`, [rows[0]!.id]);
+    }
+    const saved = await c.query<{ id: string }>(
       `INSERT INTO messages (conversation_id, direction, sender_type, message_type, content, whatsapp_message_id, status, created_at)
        VALUES ($1, 'inbound', 'customer', $2, $3, $4, 'received', $5)
-       ON CONFLICT (whatsapp_message_id) DO NOTHING`,
+       ON CONFLICT (whatsapp_message_id) DO NOTHING RETURNING id`,
       [conversationId, m.type, messageText(m), m.id, sentAt],
     );
     await c.query(
@@ -130,38 +136,70 @@ function handleMessage(m: WaMessage, profileName: string | undefined): Promise<O
       [conversationId, sentAt],
     );
     await finish(c, eventId, 'processed');
-    return 'processed';
+    const messageId = saved.rows[0]?.id;
+    return { outcome: 'processed', received: messageId ? { messageId, conversationId } : undefined };
   });
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Applies one delivery status to its outbound message. Matched by WhatsApp's message ID, or by our own message ID that
+ * Meta echoes back (biz_opaque_callback_data), which works even before the send result and its WhatsApp ID are saved.
+ * A message whose delivery was 'queued' or 'unknown' takes any status: this is how an unknown send is resolved.
+ * Returns whether a message was updated.
+ */
+export async function applyStatus(c: PoolClient, s: WaStatus): Promise<boolean> {
+  const rank = STATUS_ORDER.indexOf(s.status);
+  if (rank < 0 && s.status !== 'failed') return false;
+  // Meta's error code and title only: they describe the failure, never the message content.
+  const error = s.status === 'failed' ? (s.errors?.[0] ? `${s.errors[0].code ?? ''} ${s.errors[0].title ?? ''}`.trim() : 'Delivery failed.') : null;
+  const ourId = s.biz_opaque_callback_data && UUID.test(s.biz_opaque_callback_data) ? s.biz_opaque_callback_data : null;
+  const { rowCount } = await c.query(
+    `UPDATE messages SET status = $2, error_message = COALESCE($3, error_message), whatsapp_message_id = COALESCE(whatsapp_message_id, $1)
+     WHERE direction = 'outbound'
+       AND (whatsapp_message_id = $1 OR (id = $6::uuid AND (whatsapp_message_id IS NULL OR whatsapp_message_id = $1)))
+       AND ($2 = 'failed' OR status IN ('queued', 'unknown') OR array_position($4::text[], status) < $5)`,
+    [s.id, s.status, error, STATUS_ORDER, rank + 1, ourId],
+  );
+  return Boolean(rowCount);
 }
 
 function handleStatus(s: WaStatus): Promise<Outcome> {
   return inTransaction(async (c) => {
     const eventId = await recordEvent(c, `status:${s.id}:${s.status}`, `status.${s.status}`, s);
     if (!eventId) return 'duplicate';
-    const rank = STATUS_ORDER.indexOf(s.status);
-    if (rank < 0 && s.status !== 'failed') {
+    if (STATUS_ORDER.indexOf(s.status) < 0 && s.status !== 'failed') {
       await finish(c, eventId, 'ignored', 'Unknown status.');
       return 'ignored';
     }
-    // Meta's error code and title only: they describe the failure, never the message content.
-    const error = s.status === 'failed' ? (s.errors?.[0] ? `${s.errors[0].code ?? ''} ${s.errors[0].title ?? ''}`.trim() : 'Delivery failed.') : null;
-    const { rowCount } = await c.query(
-      `UPDATE messages SET status = $2, error_message = COALESCE($3, error_message)
-       WHERE whatsapp_message_id = $1 AND direction = 'outbound'
-         AND ($2 = 'failed' OR array_position($4::text[], status) < $5)`,
-      [s.id, s.status, error, STATUS_ORDER, rank + 1],
-    );
-    await finish(c, eventId, rowCount ? 'processed' : 'ignored', rowCount ? null : 'No matching outbound message, or a later status was already recorded.');
-    return rowCount ? 'processed' : 'ignored';
+    const applied = await applyStatus(c, s);
+    // An ignored status is kept: applyLateStatuses replays it if its message's WhatsApp ID is saved later.
+    await finish(c, eventId, applied ? 'processed' : 'ignored', applied ? null : 'No matching outbound message, or a later status was already recorded.');
+    return applied ? 'processed' : 'ignored';
   });
+}
+
+/**
+ * Replays statuses that arrived before their message's WhatsApp ID was saved and carried no callback ID (so nothing
+ * matched them then). Called right after a send saves the ID; a status Meta sends later matches directly.
+ */
+export async function applyLateStatuses(c: PoolClient, whatsappMessageId: string): Promise<void> {
+  const { rows } = await c.query<{ id: string; payload: WaStatus }>(
+    `SELECT id, payload FROM webhook_events
+     WHERE source = 'whatsapp' AND status = 'ignored' AND event_type LIKE 'status.%' AND payload->>'id' = $1
+     ORDER BY received_at, id`,
+    [whatsappMessageId],
+  );
+  for (const event of rows) if (await applyStatus(c, event.payload)) await finish(c, event.id, 'processed');
 }
 
 /**
  * Processes every message and status in a verified webhook. Each item has its own transaction, so a database
  * error rolls back only that item and is thrown: Meta then retries, and items already saved count as duplicates.
  */
-export async function processWebhook(payload: WebhookPayload): Promise<WebhookResult> {
-  const result: WebhookResult = { processed: 0, duplicate: 0, ignored: 0, failed: 0 };
+export async function processWebhook(payload: WebhookPayload): Promise<WebhookOutcome> {
+  const result: WebhookOutcome = { processed: 0, duplicate: 0, ignored: 0, failed: 0, received: [] };
   if (payload.object !== 'whatsapp_business_account') {
     result.ignored += 1;
     return result;
@@ -187,7 +225,9 @@ export async function processWebhook(payload: WebhookPayload): Promise<WebhookRe
         result.ignored += 1;
         continue;
       }
-      result[await handleMessage(m, names.get(m.from))] += 1;
+      const { outcome, received } = await handleMessage(m, names.get(m.from));
+      result[outcome] += 1;
+      if (received) result.received.push(received);
     }
     for (const s of value.statuses ?? []) {
       if (typeof s?.id !== 'string' || typeof s.status !== 'string') {

@@ -2,6 +2,7 @@ import { env } from '../../config/env.ts';
 import { query } from '../../database/pool.ts';
 import { AppError } from '../../types/errors.ts';
 import { knowledgeService } from '../knowledge/index.ts';
+import { anthropicReply } from './anthropic.ts';
 
 const API_URL = 'https://api.openai.com/v1/chat/completions';
 const HANDOVER = '[HANDOVER]';
@@ -70,41 +71,62 @@ export function openAiError(status: number, error: { code?: string; type?: strin
   return new AppError(502, 'AI_ERROR', `OpenAI request failed (HTTP ${status}).`);
 }
 
+/** A provider's answer before the handover marker is read. */
+export interface RawReply {
+  raw: string;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+}
+
+/** The provider AI_PROVIDER selects and its model, as recorded in usage_logs. Read per call, never cached. */
+export const aiProvider = () =>
+  env.AI_PROVIDER === 'anthropic' ? { provider: 'anthropic' as const, model: env.ANTHROPIC_MODEL } : { provider: 'openai' as const, model: env.OPENAI_MODEL };
+
+/** Every provider goes through here, so the handover rule is the same whichever one answers. */
 export const aiService: AiService = {
-  async generateReply({ history, businessKnowledge }) {
-    if (!env.OPENAI_API_KEY) throw new AppError(503, 'AI_NOT_CONFIGURED', 'OPENAI_API_KEY is not set.');
-    let res: Response;
-    try {
-      res = await fetch(API_URL, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: env.OPENAI_MODEL,
-          max_completion_tokens: 400,
-          messages: [
-            { role: 'system', content: systemPrompt(businessKnowledge) },
-            ...history.map((m) => ({ role: m.role === 'customer' ? 'user' : 'assistant', content: m.content })),
-          ],
-        }),
-        signal: AbortSignal.timeout(30_000),
-      });
-    } catch {
-      throw new AppError(503, 'AI_UNREACHABLE', 'Could not reach OpenAI (network error or timeout).');
-    }
-    const body = (await res.json().catch(() => ({}))) as {
-      error?: { code?: string; type?: string };
-      model?: string;
-      choices?: { message?: { content?: string | null } }[];
-      usage?: { prompt_tokens?: number; completion_tokens?: number };
-    };
-    if (!res.ok) throw openAiError(res.status, body.error);
-    const raw = body.choices?.[0]?.message?.content ?? '';
-    return {
-      text: raw.replace(HANDOVER, '').trim(),
-      model: body.model ?? env.OPENAI_MODEL,
-      inputTokens: body.usage?.prompt_tokens ?? 0,
-      outputTokens: body.usage?.completion_tokens ?? 0,
-      requestsHandover: raw.includes(HANDOVER) || !raw.trim(),
-    };
+  async generateReply(request) {
+    const system = systemPrompt(request.businessKnowledge);
+    const { raw, ...rest } = env.AI_PROVIDER === 'anthropic' ? await anthropicReply(system, request) : await openAiReply(system, request);
+    return { text: raw.replaceAll(HANDOVER, '').trim(), ...rest, requestsHandover: raw.includes(HANDOVER) || !raw.trim() };
   },
 };
+
+async function openAiReply(system: string, { history }: AiReplyRequest): Promise<RawReply> {
+  if (!env.OPENAI_API_KEY) throw new AppError(503, 'AI_NOT_CONFIGURED', 'OPENAI_API_KEY is not set.');
+  let res: Response;
+  try {
+    res = await fetch(API_URL, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: env.OPENAI_MODEL,
+        max_completion_tokens: 400,
+        messages: [
+          { role: 'system', content: system },
+          ...history.map((m) => ({ role: m.role === 'customer' ? 'user' : 'assistant', content: m.content })),
+        ],
+      }),
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch {
+    throw new AppError(503, 'AI_UNREACHABLE', 'Could not reach OpenAI (network error or timeout).');
+  }
+  const body = (await res.json().catch(() => ({}))) as {
+    error?: { code?: string; type?: string };
+    model?: string;
+    choices?: { message?: { content?: string | null }; finish_reason?: string }[];
+    usage?: { prompt_tokens?: number; completion_tokens?: number };
+  };
+  if (!res.ok) throw openAiError(res.status, body.error);
+  const choice = body.choices?.[0];
+  // Only a finished answer is sent. A reply cut off at the token limit (or filtered) has lost its [HANDOVER] marker,
+  // so it becomes empty, which hands over, as the Anthropic path does.
+  const finished = !choice?.finish_reason || choice.finish_reason === 'stop';
+  return {
+    raw: finished ? (choice?.message?.content ?? '') : '',
+    model: body.model ?? env.OPENAI_MODEL,
+    inputTokens: body.usage?.prompt_tokens ?? 0,
+    outputTokens: body.usage?.completion_tokens ?? 0,
+  };
+}

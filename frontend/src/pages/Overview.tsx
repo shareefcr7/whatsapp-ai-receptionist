@@ -99,7 +99,9 @@ export function Overview() {
           row={(c) => (
             <>
               <div className="min-w-0">
-                <CustomerCell name={c.customerName} phone={c.customerPhone} />
+                <Link to={`/conversations/${c.id}`} className="block rounded hover:text-brand-700 hover:underline">
+                  <CustomerCell name={c.customerName} phone={c.customerPhone} />
+                </Link>
                 {c.lastMessage && <p className="mt-1 truncate text-stone-500">{c.lastMessage}</p>}
               </div>
               <StatusBadge status={c.status} />
@@ -148,7 +150,7 @@ export function Overview() {
         <Card title="API and system status">
           <StatusList items={[api, database, ...integrationItems(index.result?.data, google.result?.data)]} />
           <p className="border-t border-stone-100 px-5 py-3 text-xs text-stone-500">
-            WhatsApp webhook, OpenAI replies and Google Calendar are built. WhatsApp is not connected until Meta verifies the webhook; bookings do not use the calendar yet.
+            WhatsApp webhook, AI replies and Google Calendar are built. WhatsApp is not connected until Meta verifies the webhook; bookings do not use the calendar yet.
           </p>
         </Card>
       </div>

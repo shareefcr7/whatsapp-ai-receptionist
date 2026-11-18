@@ -3,9 +3,12 @@ import assert from 'node:assert/strict';
 import { createHash, randomBytes } from 'node:crypto';
 import type { Server } from 'node:http';
 import { after, before, beforeEach, describe, it } from 'node:test';
+import { assertDisposableDatabaseUrl, isDatabaseVerified } from './helpers/db-hygiene.ts';
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL;
+assertDisposableDatabaseUrl(testDatabaseUrl); // before any hook: after() hooks still run if before() fails
 Object.assign(process.env, {
+  PGAPPNAME: 'receptionist-test', // tags this run's sessions; see test/helpers/db-hygiene.ts
   NODE_ENV: 'test',
   DATABASE_URL: testDatabaseUrl ?? '',
   FRONTEND_URL: 'http://localhost:5173',
@@ -20,6 +23,7 @@ const { app } = await import('../src/app.ts');
 const { parseEnv } = await import('../src/config/env.ts');
 const { closePool, pool } = await import('../src/database/pool.ts');
 const { migrate } = await import('../src/database/migrate.ts');
+const { prepareTestDatabase } = await import('./helpers/db-hygiene.ts');
 const { hashPassword } = await import('../src/services/auth/index.ts');
 const { calendarService, CALENDAR_API } = await import('../src/services/calendar/index.ts');
 const { decrypt, encrypt, REVOKE_URL, SCOPES, TOKEN_URL } = await import('../src/services/calendar/oauth.ts');
@@ -126,6 +130,7 @@ describe('Google Calendar OAuth and API', { skip: !testDatabaseUrl }, () => {
     const address = server.address();
     assert(address && typeof address === 'object');
     base = `http://127.0.0.1:${address.port}/api`;
+    await prepareTestDatabase(pool!); // refuses a non-_test database; recovers from an interrupted earlier run
     await migrate();
     await pool!.query(
       `INSERT INTO staff_users (email, full_name, role, password_hash) VALUES
@@ -147,10 +152,16 @@ describe('Google Calendar OAuth and API', { skip: !testDatabaseUrl }, () => {
 
   after(async () => {
     server.close();
-    await pool!.query('DELETE FROM google_calendar_connection');
-    await pool!.query(`DELETE FROM staff_users WHERE email LIKE 'cal-%@example.test'`); // cascades to states and sessions
-    await closePool();
-    globalThis.fetch = realFetch;
+    // Only once the server confirmed a _test database: after() still runs when before() failed that check.
+    try {
+      if (isDatabaseVerified()) {
+        await pool!.query('DELETE FROM google_calendar_connection');
+        await pool!.query(`DELETE FROM staff_users WHERE email LIKE 'cal-%@example.test'`); // cascades to states and sessions
+      }
+    } finally {
+      globalThis.fetch = realFetch;
+      await closePool(); // also when the clean-up fails, so the run cannot hang on open connections
+    }
   });
 
   it('authorize asks for offline access with state, PKCE and only calendar scopes', async () => {

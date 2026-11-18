@@ -3,10 +3,13 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import type { Server } from 'node:http';
 import { after, before, describe, it } from 'node:test';
+import { assertDisposableDatabaseUrl, isDatabaseVerified } from './helpers/db-hygiene.ts';
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL;
+assertDisposableDatabaseUrl(testDatabaseUrl); // before any hook: after() hooks still run if before() fails
 process.env.NODE_ENV = 'test';
 process.env.DATABASE_URL = testDatabaseUrl ?? '';
+process.env.PGAPPNAME = 'receptionist-test'; // tags this run's sessions; see test/helpers/db-hygiene.ts
 
 const { app } = await import('../src/app.ts');
 const { parseEnv } = await import('../src/config/env.ts');
@@ -22,6 +25,7 @@ const { integrationStatus } = await import('../src/services/integrations.ts');
 const { hashPassword, verifyPassword } = await import('../src/services/auth/index.ts');
 const { createStaffAccount, emailExists, parseRole, resetStaffPassword } = await import('../src/database/create-staff.ts');
 const { passwordProblem } = await import('../src/types/api.ts');
+const { prepareTestDatabase, TEST_EMAIL_PATTERN } = await import('./helpers/db-hygiene.ts');
 
 let server: Server;
 let base: string;
@@ -38,7 +42,13 @@ before(async () => {
   assert(address && typeof address === 'object');
   base = `http://127.0.0.1:${address.port}/api`;
   if (!testDatabaseUrl) return;
+  await prepareTestDatabase(pool!); // refuses a non-_test database; recovers from an interrupted earlier run
   await migrate();
+  // This file asserts on whole-table states ("a fresh database", totals), so it starts them empty even after an
+  // interrupted earlier run. Not namespaced: acceptable only because the _test guards above have passed.
+  await pool!.query('DELETE FROM usage_logs');
+  await pool!.query('DELETE FROM business_info');
+  await pool!.query('DELETE FROM services');
   await pool!.query(
     `INSERT INTO staff_users (email, full_name, role, password_hash) VALUES
        ('admin@example.test', 'Test Admin', 'admin', $1), ('agent@example.test', 'Test Agent', 'agent', $2)`,
@@ -50,8 +60,13 @@ before(async () => {
 
 after(async () => {
   server.close();
-  if (testDatabaseUrl) await pool!.query('DELETE FROM staff_users');
-  await closePool();
+  // Test accounts only (every one this file creates is @example.test), never every staff user.
+  // Only once the server confirmed a _test database: after() still runs when before() failed that check.
+  try {
+    if (testDatabaseUrl && isDatabaseVerified()) await pool!.query(`DELETE FROM staff_users WHERE email LIKE $1`, [TEST_EMAIL_PATTERN]);
+  } finally {
+    await closePool(); // also when the clean-up fails, so the run cannot hang on open connections
+  }
 });
 
 const anonymous = async (path: string, init?: RequestInit) => {
@@ -336,7 +351,7 @@ describe('with PostgreSQL', { skip: !testDatabaseUrl }, () => {
     const { status, body } = await get('/health/database');
     assert.equal(status, 200);
     assert.equal(body.data.status, 'connected');
-    assert.equal(body.data.migrationsApplied, 3);
+    assert.equal(body.data.migrationsApplied, 6);
   });
 
   it('a fresh database returns identified empty states', async () => {
@@ -461,6 +476,12 @@ describe('staff authentication', { skip: !testDatabaseUrl }, () => {
     ['GET', '/health/database'],
     ['GET', '/dashboard/summary'],
     ['GET', '/conversations'],
+    ['GET', '/conversations/00000000-0000-4000-8000-000000000000'],
+    ['POST', '/conversations/00000000-0000-4000-8000-000000000000/takeover'],
+    ['POST', '/conversations/00000000-0000-4000-8000-000000000000/reopen'],
+    ['POST', '/conversations/00000000-0000-4000-8000-000000000000/close'],
+    ['POST', '/conversations/00000000-0000-4000-8000-000000000000/messages'],
+    ['POST', '/conversations/00000000-0000-4000-8000-000000000000/reactivate'],
     ['GET', '/leads'],
     ['GET', '/appointments'],
     ['GET', '/usage'],
@@ -586,10 +607,12 @@ describe('staff authentication', { skip: !testDatabaseUrl }, () => {
     assert.equal((await anonymous('/auth/me', { headers: { cookie: agentCookie } })).status, 200);
   });
 
-  it('agents can read but only admins can change anything', async () => {
+  it('agents can read and handle conversations, but only admins can change anything else', async () => {
     assert.equal((await send('GET', '/services', undefined, agentCookie)).status, 200);
     assert.equal((await send('GET', '/business-info', undefined, agentCookie)).status, 200);
-    const writes = PROTECTED.filter(([method]) => method !== 'GET');
+    // Front-line work for any staff member; tested in conversations.test.ts.
+    const agentWork = /\/conversations\/[^/]+\/(takeover|reopen|close|messages)$/;
+    const writes = PROTECTED.filter(([method, path]) => method !== 'GET' && !agentWork.test(path));
     for (const [method, path] of writes) {
       const { status, body } = await send(method, path, {}, agentCookie);
       assert.equal(status, 403, `${method} ${path}`);
